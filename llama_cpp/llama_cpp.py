@@ -868,7 +868,6 @@ class llama_model_params(ctypes.Structure):
         ("n_gpu_layers", ctypes.c_int32),
         ("split_mode", ctypes.c_int),
         ("load_mode", ctypes.c_int),
-        ("lazy_mode", ctypes.c_int),
         ("main_gpu", ctypes.c_int32),
         ("tensor_split", ctypes.POINTER(ctypes.c_float)),
         ("progress_callback", llama_progress_callback),
@@ -1080,6 +1079,8 @@ class llama_context_params(ctypes.Structure):
         ("cb_eval_user_data", ctypes.c_void_p),
         ("type_k", ctypes.c_int),
         ("type_v", ctypes.c_int),
+        # kv-stream fork (d873e5db9) 在 type_v 之后新增的字段，0 = 关闭
+        ("kv_stream_stage_mib", ctypes.c_uint32),
         ("abort_callback", ggml_abort_callback),
         ("abort_callback_data", ctypes.c_void_p),
         ("embeddings", ctypes.c_bool),

@@ -194,6 +194,8 @@ class Llama:
         # KV cache quantization
         type_k: Optional[int] = None,
         type_v: Optional[int] = None,
+        # Adaptive KV streaming (kv-stream fork only, MiB; None = read env LLAMA_ARG_KV_STREAM_STAGE_MIB)
+        kv_stream_stage_mib: Optional[int] = None,
         # Misc
         spm_infill: bool = False,
         # Log
@@ -300,6 +302,7 @@ class Llama:
             tokenizer: Optional tokenizer to override the default tokenizer from llama.cpp.
             type_k: KV cache data type for K (default: f16)
             type_v: KV cache data type for V (default: f16)
+            kv_stream_stage_mib: block-streaming KV resident+staging pool in MiB (kv-stream fork; 0 = off)
             spm_infill: Use Suffix/Prefix/Middle pattern for infill (instead of Prefix/Suffix/Middle) as some models prefer this.
             verbose: Backward-compatible boolean switch for native llama.cpp / ggml runtime logs.
                 False keeps only error-level native logs; True enables debug-level native logs.
@@ -415,7 +418,10 @@ class Llama:
         self.model_params.n_gpu_layers = self._parse_n_gpu_layers(n_gpu_layers)
         self.model_params.split_mode = split_mode
         self.model_params.load_mode = load_mode
-        self.model_params.lazy_mode = lazy_mode
+        self.lazy_mode = lazy_mode
+        # 本构建基于的 llama.cpp 没有懒加载字段，新版上游才有
+        if hasattr(self.model_params, "lazy_mode"):
+            self.model_params.lazy_mode = lazy_mode
         self.model_params.main_gpu = main_gpu
         self.tensor_split = tensor_split
         self._c_tensor_split = None
@@ -704,6 +710,10 @@ class Llama:
             self.context_params.type_k = type_k
         if type_v is not None:
             self.context_params.type_v = type_v
+        # Adaptive KV streaming; 未显式给值时允许用环境变量全局打开
+        if kv_stream_stage_mib is None:
+            kv_stream_stage_mib = int(os.environ.get("LLAMA_ARG_KV_STREAM_STAGE_MIB") or 0)
+        self.context_params.kv_stream_stage_mib = max(0, int(kv_stream_stage_mib))
         # Sampling Params
         self.context_params.no_perf = no_perf
         self.last_n_tokens_size = last_n_tokens_size
@@ -4479,7 +4489,7 @@ prompt: The prompt to generate text from.
             n_cpu_moe=self.n_cpu_moe,
             split_mode=self.model_params.split_mode,
             load_mode=self.model_params.load_mode,
-            lazy_mode=self.model_params.lazy_mode,
+            lazy_mode=self.lazy_mode,
             main_gpu=self.model_params.main_gpu,
             tensor_split=self.tensor_split,
             kv_overrides=self.kv_overrides,
@@ -4532,6 +4542,7 @@ prompt: The prompt to generate text from.
             # KV cache quantization
             type_k=self.context_params.type_k,
             type_v=self.context_params.type_v,
+            kv_stream_stage_mib=self.context_params.kv_stream_stage_mib,
             # Misc
             spm_infill=self.spm_infill,
             verbose=self.verbose,

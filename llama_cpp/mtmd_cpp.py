@@ -270,7 +270,7 @@ class clip_context_params(Structure):
 class mtmd_context_params(Structure):
     _fields_ = [
         ("use_gpu", c_bool),
-        ("device", c_void_p),
+        # fork 的 mtmd.h 没有 device 字段，保留会把后面全部字段错位 8 字节
         ("print_timings", c_bool),
         ("n_threads", c_int),
         ("image_marker", c_char_p),
@@ -502,7 +502,7 @@ def mtmd_bitmap_set_id(
     "mtmd_bitmap_set_mergeable", [
         mtmd_bitmap_p_ctypes,
         c_bool,
-    ], None)
+    ], None, required=False)
 def mtmd_bitmap_set_mergeable(
     bitmap: mtmd_bitmap_p,
     mergeable: bool,
@@ -681,7 +681,7 @@ def mtmd_input_chunk_free(chunk: mtmd_input_chunk_p):
 
 # // similar to mtmd_input_chunk_copy, but returns a placeholder chunk
 # MTMD_API mtmd_input_chunk * mtmd_input_chunk_get_placeholder(const mtmd_input_chunk * chunk);
-@ctypes_function_mtmd("mtmd_input_chunk_get_placeholder", [mtmd_input_chunk_p_ctypes], mtmd_input_chunk_p_ctypes)
+@ctypes_function_mtmd("mtmd_input_chunk_get_placeholder", [mtmd_input_chunk_p_ctypes], mtmd_input_chunk_p_ctypes, required=False)
 def mtmd_input_chunk_get_placeholder(chunk: mtmd_input_chunk_p) -> mtmd_input_chunk_p:
     """
     similar to mtmd_input_chunk_copy, but returns a placeholder chunk
@@ -901,6 +901,7 @@ def mtmd_tokenize(
         c_bool,
     ],
     c_int32,
+    required=False,
 )
 def mtmd_tokenize_from_parts(
     ctx: mtmd_context_p,
@@ -1378,6 +1379,7 @@ mtmd_helper_init_opt_p_ctypes = POINTER(mtmd_helper_init_opt)
     "mtmd_helper_init_opt_default",
     [],
     mtmd_helper_init_opt,
+    required=False,
 )
 def mtmd_helper_init_opt_default() -> mtmd_helper_init_opt:
     """Get the default options for mtmd_helper_bitmap_init_from_*()."""

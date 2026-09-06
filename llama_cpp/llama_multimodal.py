@@ -178,7 +178,12 @@ class MTMDChatHandler:
             self._mtmd_helper_init_opt = mtmd_helper_init_opt
             self._video_ffmpeg_bin_dir_bytes: Optional[bytes] = None
         else:
-            self._mtmd_helper_init_opt = mtmd_cpp.mtmd_helper_init_opt_default()
+            # kv-stream fork 的 mtmd 库没有 *_default 构造函数，退回全零结构；
+            # 图片解码不受影响，视频参数只在显式传入时才生效
+            try:
+                self._mtmd_helper_init_opt = mtmd_cpp.mtmd_helper_init_opt_default()
+            except (AttributeError, RuntimeError):
+                self._mtmd_helper_init_opt = mtmd_cpp.mtmd_helper_init_opt()
             self._video_ffmpeg_bin_dir_bytes = None
             if video_fps_target is not None:
                 self._mtmd_helper_init_opt.video_params.fps_target = video_fps_target
