@@ -1,4 +1,4 @@
 [submodule "vendor/llama.cpp"]
 	path = vendor/llama.cpp
-	url = https://github.com/RaymondHuang210129/llama.cpp-adaptive-kv-streaming
+	url = https://github.com/LLAI-lab/llama.cpp.git
 	branch = feature/adaptive-kv-stream
