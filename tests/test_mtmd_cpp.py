@@ -7,6 +7,10 @@ from unittest.mock import Mock
 import pytest
 
 
+def _init_opt_available(module) -> bool:
+    return not getattr(module.mtmd_helper_init_opt_default, "__ctypes_optional__", False)
+
+
 def test_import_mtmd_cpp():
     module = importlib.import_module("llama_cpp.mtmd_cpp")
 
@@ -39,6 +43,9 @@ def test_mtmd_helper_init_opt_abi():
     ]
     assert module.mtmd_helper_video_init.restype is module.mtmd_helper_video_p_ctypes
 
+    if not _init_opt_available(module):
+        # kv-stream fork builds do not export mtmd_helper_init_opt_default
+        pytest.skip("mtmd_helper_init_opt_default is unavailable in this build")
     opt = module.mtmd_helper_init_opt_default()
     assert opt.video_params.fps_target == 4.0
     assert opt.video_params.ffmpeg_bin_dir is None
@@ -68,7 +75,11 @@ def test_mtmd_chat_handler_video_options(tmp_path, handler_name):
     assert video_params.ffmpeg_bin_dir == os.fsencode(os.path.abspath(tmp_path))
     assert video_params.timestamp_interval_ms == 10000
 
-    opt = module.mtmd_helper_init_opt_default()
+    if _init_opt_available(module):
+        opt = module.mtmd_helper_init_opt_default()
+    else:
+        # kv-stream fork builds: zero-initialized struct is the runtime fallback
+        opt = module.mtmd_helper_init_opt()
     handler = handler_class(
         mmproj_path=str(tmp_path),
         mtmd_helper_init_opt=opt,
