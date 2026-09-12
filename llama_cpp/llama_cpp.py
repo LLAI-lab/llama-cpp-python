@@ -4544,13 +4544,17 @@ def llama_sampler_chain_get(
     ...
 
 
-# LLAMA_API int                    llama_sampler_chain_n  (const struct llama_sampler * chain);
+# // the total number of samplers in the chain
+# LLAMA_API int32_t                llama_sampler_chain_n  (const struct llama_sampler * chain);
 @ctypes_function(
     "llama_sampler_chain_n",
     [llama_sampler_p_ctypes],
-    ctypes.c_int,
+    ctypes.c_int32,
 )
 def llama_sampler_chain_n(chain: llama_sampler_p, /) -> int:
+    """
+    the total number of samplers in the chain
+    """
     ...
 
 

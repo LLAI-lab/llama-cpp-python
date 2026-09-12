@@ -8,6 +8,7 @@ import sys
 import zlib
 
 from contextlib import ExitStack
+from typing_extensions import Self
 from typing import (
     Any,
     Dict,
@@ -41,59 +42,8 @@ from llama_cpp.llama_chat_format import (
     ImmutableSandboxedEnvironment
 )
 
-class MTMDChatHandler:
-    DEFAULT_SYSTEM_MESSAGE: Optional[str] = (
-"You are an exceptionally capable, precise, and helpful multimodal AI assistant that excels at deeply understanding and richly describing images, charts, diagrams, text in images, scenes, and any visual content, "
-"while also answering every question accurately, clearly, and step-by-step when appropriate — always responding in the same language as the user's question, remaining polite, professional, and maximally helpful."
-    )
-
-    CHAT_FORMAT = (
-        "{{ bos_token if bos_token is defined else '' }}"
-        "{% for message in messages %}"
-            "{% if message.role == 'system' %}"
-                "{{ message.content }}"
-            "{% elif message.role == 'user' %}"
-                "USER: "
-                "{% if message.content is string %}"
-                    "{{ message.content }}"
-                "{% elif message.content is iterable %}"
-                    "{% for content in message.content %}"
-                        "{% if content.type == 'image_url' %}"
-                            "{{ content.image_url if content.image_url is string else content.image_url.url }}"
-                        "{% elif content.type == 'audio_url' %}"
-                            "{{ content.audio_url if content.audio_url is string else content.audio_url.url }}"
-                        "{% elif content.type == 'input_audio' %}"
-                            "{% if content.input_audio is string %}"
-                                "{{ content.input_audio }}"
-                            "{% else %}"
-                                "data:audio/{{ content.input_audio.format }};base64,{{ content.input_audio.data }}"
-                            "{% endif %}"
-                        "{% elif content.type == 'video_url' %}"
-                            "{{ content.video_url if content.video_url is string else content.video_url.url }}"
-                        "{% elif content.type == 'video' %}"
-                            "{{ content.video if content.video is string else content.video.url }}"
-                        "{% elif content.type == 'text' %}"
-                            "{{ content.text }}"
-                        "{% endif %}"
-                    "{% endfor %}"
-                "{% endif %}"
-
-            "{% elif message.role == 'assistant' and message.content is not none %}"
-                "ASSISTANT: {{ message.content }}"
-            "{% endif %}"
-            "{{ \"\n\" }}"
-        "{% endfor %}"
-
-        "{% if eos_token is defined %}"
-            "{{ eos_token }}"
-        "{% endif %}"
-
-        "{% if add_generation_prompt %}"
-            "ASSISTANT: "
-        "{% endif %}"
-    )
-
-    KNOWN_MEDIA_TAGS: List[str] = []
+class MTMDBaseHandler:
+    """Shared mtmd configuration, context lifecycle, and media loading."""
 
     def __init__(
         self,
@@ -102,9 +52,7 @@ class MTMDChatHandler:
         use_gpu: bool = True,
         image_min_tokens: int = -1,
         image_max_tokens: int = -1,
-        chat_template_override: Optional[str] = None,
         batch_max_tokens: int = 1024,
-        extra_template_arguments: Optional[Dict[str, Any]] = None,
         mtmd_helper_init_opt: Optional[Any] = None,
         video_fps_target: Optional[float] = None,
         video_ffmpeg_bin_dir: Optional[Union[str, os.PathLike[str]]] = None,
@@ -228,42 +176,11 @@ class MTMDChatHandler:
                     video_timestamp_interval_ms
                 )
 
-        if extra_template_arguments is not None and not isinstance(extra_template_arguments, dict):
-            raise TypeError(
-                f"{self.log_prefix}(__init__): `extra_template_arguments` must be a dict."
-            )
-
-        # Preserve subclass attributes
-        if not hasattr(self, "chat_format"):
-            self.chat_format = None
-
-        self.chat_format_override = chat_template_override
-        self.extra_template_arguments: dict[str, Any] = dict(extra_template_arguments or {})
-
         self.is_support_vision = False
         self.is_support_audio = False
         self.is_support_video = False
 
-        self.chat_template = None
-        self._chat_format_parser_tags = []
-        self._template_initialized = False
-
-        # Pre-compile Jinja template
-        if self.chat_format is None:
-            if self.chat_format_override is not None:
-                self.chat_format = self.chat_format_override
-            else:
-                self.chat_format = self.CHAT_FORMAT
-
-        self._change_chat_template(self.chat_format)
-
         self._exit_stack = ExitStack()
-
-    def _change_chat_template(self, new_template: str):
-        self.chat_template = ImmutableSandboxedEnvironment(
-            trim_blocks=True,
-            lstrip_blocks=True
-        ).from_string(new_template)
 
     def _init_mtmd_context(self, llama_model: llama_core.Llama):
         """Initialize mtmd context with the llama model."""
@@ -288,10 +205,6 @@ class MTMDChatHandler:
             raise ValueError(f"{self.log_prefix}(_init_mtmd_context): Configuration Error! image_max_tokens ({self.image_max_tokens}) "
                                 f"cannot be less than image_min_tokens ({self.image_min_tokens}).")
         self.mctx_params.batch_max_tokens = self.batch_max_tokens
-
-        # Cache the model's eos token and bos token
-        self.mtmd_eos_token=llama_model.detokenize([llama_model.token_eos()]).decode('utf-8', errors='ignore')
-        self.mtmd_bos_token=llama_model.detokenize([llama_model.token_bos()]).decode('utf-8', errors='ignore')
 
         # Cache the mtmd_default_marker
         self.media_marker = self._mtmd_cpp.mtmd_default_marker().decode('utf-8')
@@ -334,26 +247,495 @@ class MTMDChatHandler:
                 print(f"{self.log_prefix}(_init_mtmd_context): Video support is NOT available in this build.", file=sys.stderr)
 
     def close(self) -> None:
-        """Explicitly free the mtmd context and vision model resources."""
-        if getattr(self, "mtmd_ctx", None) is not None:
+        """Explicitly free the shared mtmd resources."""
+        cleanup = getattr(self, "_exit_stack", None)
+        self._exit_stack = None
+        try:
+            # Dependent resources must be freed before the mtmd context.
+            if cleanup is not None:
+                cleanup.close()
+        finally:
+            if getattr(self, "mtmd_ctx", None) is not None:
+                try:
+                    self._mtmd_cpp.mtmd_free(self.mtmd_ctx)
+                    self.mtmd_ctx = None
+                except Exception:
+                    pass
+            self.mctx_params = None
+
+    def __del__(self) -> None:
+        self.close()
+
+    def _create_bitmap_from_bytes(self, media_bytes: bytes):
+        """
+        Constructs an mtmd_bitmap structure from a raw byte buffer containing media data.
+
+        Supported formats:
+          - Images (via stb_image): jpg, png, bmp, etc.
+          - Audio (via miniaudio): wav, mp3, flac.
+          - Video: depends on whether MTMD_VIDEO was enabled at build time.
+
+        Note:
+          - Media types (Image vs. Audio) are auto-detected by the C++ backend using magic bytes.
+          - The underlying C++ helper function is thread-safe, making it suitable for concurrent preprocessing.
+
+        Args:
+            media_bytes (bytes): The raw byte content of the media file.
+
+        Returns:
+            bitmap: mtmd_bitmap *
+            video_ctx: mtmd_helper_video * or NULL
+        """
+        if self.mtmd_ctx is None:
+            raise ValueError(f"{self.log_prefix}(_create_bitmap_from_bytes): mtmd context not initialized.")
+
+        if not media_bytes:
+            raise ValueError(f"{self.log_prefix}(_create_bitmap_from_bytes): empty media bytes.")
+
+        buf = (ctypes.c_uint8 * len(media_bytes)).from_buffer_copy(media_bytes)
+
+        wrapper = self._mtmd_cpp.mtmd_helper_bitmap_init_from_buf(
+            self.mtmd_ctx,
+            buf,
+            len(media_bytes),
+            False,
+            self._mtmd_helper_init_opt,
+        )
+
+        if not wrapper.bitmap:
+            if wrapper.video_ctx:
+                self._mtmd_cpp.mtmd_helper_video_free(wrapper.video_ctx)
+
+            raise ValueError(
+                f"{self.log_prefix}(_create_bitmap_from_bytes): "
+                "Failed to load media from bytes "
+                "(unsupported media format, corrupted data, or missing helper support)."
+            )
+
+        return wrapper.bitmap, wrapper.video_ctx
+
+    def _is_text_chunk(self, chunk_type: int) -> bool:
+        """Return True if `chunk_type` is the MTMD text chunk type enum value."""
+        return (
+            chunk_type
+            == self._mtmd_cpp.mtmd_input_chunk_type.MTMD_INPUT_CHUNK_TYPE_TEXT
+        )
+
+    def _is_image_chunk(self, chunk_type: int) -> bool:
+        """Return True if `chunk_type` is the MTMD image chunk type enum value."""
+        return (
+            chunk_type
+            == self._mtmd_cpp.mtmd_input_chunk_type.MTMD_INPUT_CHUNK_TYPE_IMAGE
+        )
+
+    def _is_audio_chunk(self, chunk_type: int) -> bool:
+        """Return True if `chunk_type` is the MTMD audio chunk type enum value."""
+        return (
+            chunk_type
+            == self._mtmd_cpp.mtmd_input_chunk_type.MTMD_INPUT_CHUNK_TYPE_AUDIO
+        )
+
+    def _free_mtmd_resources(self, chunks=None, bitmaps=None, videos=None):
+        """Release all owned resources, even if an individual free raises."""
+        with ExitStack() as cleanup:
+            # Callbacks run in reverse order: chunks, bitmaps, then videos.
+            for resources, free in (
+                (videos, self._mtmd_cpp.mtmd_helper_video_free),
+                (bitmaps, self._mtmd_cpp.mtmd_bitmap_free),
+            ):
+                if resources:
+                    for resource in reversed(resources):
+                        cleanup.callback(free, resource)
+                    # Transfer ownership before freeing so outer cleanup cannot retry these pointers.
+                    resources.clear()
+            if chunks is not None:
+                cleanup.callback(self._mtmd_cpp.mtmd_input_chunks_free, chunks)
+
+    def load_media(self, media_url: str, media_type: str) -> bytes:
+        """
+        Unified dispatcher for loading media payloads.
+        Routes the URL/URI to the specific image, audio, or video processor based on the media_type.
+        """
+        if media_type == "image":
+            return self._load_image(media_url)
+
+        elif media_type == "audio":
+            audio_bytes = self._load_bytes(media_url, timeout=15, kind="audio")
             try:
-                self._mtmd_cpp.mtmd_free(self.mtmd_ctx)
-                self.mtmd_ctx = None
-            except Exception:
-                pass
-        self.mctx_params = None
+                self.detect_audio_format(audio_bytes)
+            except ValueError as e:
+                raise ValueError(f"{self.log_prefix}(load_media): {e}")
+            return audio_bytes
+
+        elif media_type == "video":
+            return self._load_bytes(media_url, timeout=30, kind="video")
+
+        else:
+            raise ValueError(f"{self.log_prefix}(load_media): Unknown media type '{media_type}'")
+
+    @staticmethod
+    def detect_audio_format(audio_bytes: bytes) -> str:
+        """
+        Pure utility function: Detects the audio format from magic bytes.
+        Strictly translated from llama.cpp's `is_audio_file` to ensure 100% compatibility
+        and avoid false positives (e.g., AVI files disguised as RIFF).
+        """
+        length = len(audio_bytes)
+
+        if length < 12:
+            raise ValueError("Audio data is corrupted or too small (less than 12 bytes).")
+
+        # RIFF & WAVE magic bytes verification
+        is_wav = audio_bytes.startswith(b"RIFF") and audio_bytes[8:12] == b"WAVE"
+
+        # ID3 metadata or MPEG sync word verification
+        is_mp3 = length >= 3 and (
+            audio_bytes.startswith(b"ID3") or
+            (audio_bytes[0] == 0xFF and (audio_bytes[1] & 0xE0) == 0xE0)
+        )
+
+        # FLAC magic bytes verification
+        is_flac = audio_bytes.startswith(b"fLaC")
+
+        if is_wav:
+            return "wav"
+        elif is_mp3:
+            return "mp3"
+        elif is_flac:
+            return "flac"
+        else:
+            raise ValueError(
+                "Unsupported audio format detected via magic bytes. "
+                "The underlying C++ miniaudio backend ONLY supports WAV, MP3, and FLAC."
+            )
+
+    DEFAULT_HTTP_HEADERS = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/152.0.0.0 Safari/537.36"
+        ),
+    }
+
+    @classmethod
+    def _load_bytes(cls, media_url: str, timeout: int = 15, kind: str = "media") -> bytes:
+        """
+        Load raw bytes from a data URI, local file path, or remote HTTP/HTTPS URL.
+        """
+        media_bytes = b""
+
+        # 1. Handle data URI
+        if media_url.strip().startswith("data:"):
+            comma_pos = media_url.find(",")
+            if comma_pos == -1:
+                raise ValueError("Invalid data URI: missing comma separator")
+
+            base64_data = media_url[comma_pos + 1:]
+            media_bytes = base64.b64decode(base64_data)
+
+        # 2. Handle local file path
+        elif os.path.exists(media_url):
+            with open(media_url, "rb") as f:
+                media_bytes = f.read()
+
+        # 3. Handle remote URL via HTTP/HTTPS
+        else:
+            req = urllib.request.Request(
+                media_url,
+                headers=cls.DEFAULT_HTTP_HEADERS,
+            )
+            try:
+                with urllib.request.urlopen(req, timeout=timeout) as f:
+                    media_bytes = f.read()
+            except (URLError, HTTPError) as e:
+                raise ConnectionError(f"Failed to download {kind} from {media_url}: {e}")
+
+        if not media_bytes:
+            raise ValueError(f"Empty {kind} data received")
+
+        return media_bytes
+
+    @classmethod
+    def _load_image(cls, image_url: str) -> bytes:
+        """
+        Load an image from either a URL or a data URI and return it as JPEG bytes.
+
+        Supports:
+        - Remote images via HTTP/HTTPS (with proper User-Agent)
+        - Data URIs (base64-encoded, e.g., data:image/png;base64,...)
+        - Images with alpha channel (PNG, WebP, etc.) → automatically composites on white/black background
+        - Any format that Pillow can open. See: https://pillow.readthedocs.io/en/stable/handbook/image-file-formats.html
+
+        Returns:
+            JPEG-encoded bytes (quality=95) in RGB mode, suitable for most vision models.
+        """
+        # 1. Load image bytes from image_url
+        image_bytes = cls._load_bytes(
+            image_url,
+            timeout=15,
+            kind="image",
+        )
+
+        # 2. Check if image_bytes is empty.
+        if not image_bytes:
+            raise ValueError("Empty image data received")
+
+        # 3. Open image with Pillow
+        try:
+            from PIL import Image, ImageStat
+        except ImportError:
+            raise ImportError("Pillow is required for image processing. Install with: pip install pillow")
+
+        import io
+        image = Image.open(io.BytesIO(image_bytes))
+
+        # 4. Handle transparency (RGBA, LA, P with transparency, etc.)
+        if image.mode in ("RGBA", "LA", "PA") or (image.mode == "P" and "transparency" in image.info):
+            # Use alpha channel as mask
+            if image.mode == "P":
+                image = image.convert("RGBA")
+
+            alpha = image.split()[-1]  # Last channel is alpha
+            # Compute average brightness of visible (non-transparent) pixels
+            stat = ImageStat.Stat(image.convert("L"), mask=alpha)
+
+            # Choose background: white for dark content, black for bright content
+            bg_color = (255, 255, 255)  # white
+            if stat.count[0] > 0 and stat.mean[0] > 127:
+                bg_color = (0, 0, 0)  # black
+
+            background = Image.new("RGB", image.size, bg_color)
+            background.paste(image, mask=alpha)
+            image = background
+
+        # 5. Ensure RGB mode for formats like CMYK, palette, etc.
+        elif image.mode != "RGB":
+            image = image.convert("RGB")
+
+        # 6. Save as high-quality JPEG, suitable for most vision models.
+        output = io.BytesIO()
+        image.save(output, format="JPEG", quality=95, optimize=True, progressive=True)
+        return output.getvalue()
+
+    @classmethod
+    def from_pretrained(
+        cls,
+        repo_id: str,
+        filename: Optional[str],
+        local_dir: Optional[Union[str, os.PathLike[str]]] = None,
+        local_dir_use_symlinks: Union[bool, Literal["auto"]] = "auto",
+        cache_dir: Optional[Union[str, os.PathLike[str]]] = None,
+        **kwargs: Any,
+    ) -> Self:
+        import fnmatch
+        from pathlib import Path
+
+        try:
+            from huggingface_hub import hf_hub_download, HfFileSystem  # type: ignore
+            from huggingface_hub.utils import validate_repo_id  # type: ignore
+        except ImportError:
+            raise ImportError(
+                "Llama.from_pretrained requires the huggingface_hub package. "
+                "You can install it with `pip install --upgrade huggingface_hub`."
+            )
+
+        validate_repo_id(repo_id)
+
+        hffs = HfFileSystem()
+
+        files = [
+            file["name"] if isinstance(file, dict) else file
+            for file in hffs.ls(repo_id)  # type: ignore
+        ]
+
+        # split each file into repo_id, subfolder, filename
+        file_list: List[str] = []
+        for file in files:
+            rel_path = Path(file).relative_to(repo_id)
+            file_list.append(str(rel_path))
+
+        matching_files = [file for file in file_list if fnmatch.fnmatch(file, filename)]  # type: ignore
+
+        if len(matching_files) == 0:
+            raise ValueError(
+                f"No file found in {repo_id} that match {filename}\n\n"
+                f"Available Files:\n{json.dumps(file_list)}"
+            )
+
+        if len(matching_files) > 1:
+            raise ValueError(
+                f"Multiple files found in {repo_id} matching {filename}\n\n"
+                f"Available Files:\n{json.dumps(files)}"
+            )
+
+        (matching_file,) = matching_files
+
+        subfolder = str(Path(matching_file).parent)
+        filename = Path(matching_file).name
+
+        # download the file
+        hf_hub_download(
+            repo_id=repo_id,
+            filename=filename,
+            subfolder=subfolder,
+            local_dir=cast(Union[str, Path, None], local_dir),
+            local_dir_use_symlinks=local_dir_use_symlinks,
+            cache_dir=cast(Union[str, Path, None], cache_dir),
+        )
+
+        if local_dir is None:
+            model_path = hf_hub_download(
+                repo_id=repo_id,
+                filename=filename,
+                subfolder=subfolder,
+                local_dir=local_dir,
+                local_dir_use_symlinks=local_dir_use_symlinks,
+                cache_dir=cast(Union[str, Path, None], cache_dir),
+                local_files_only=True,
+            )
+        else:
+            model_path = os.path.join(local_dir, filename)
+
+        return cls(
+            mmproj_path=model_path,
+            **kwargs,
+        )
+
+
+
+class MTMDChatHandler(MTMDBaseHandler):
+    DEFAULT_SYSTEM_MESSAGE: Optional[str] = (
+"You are an exceptionally capable, precise, and helpful multimodal AI assistant that excels at deeply understanding and richly describing images, charts, diagrams, text in images, scenes, and any visual content, "
+"while also answering every question accurately, clearly, and step-by-step when appropriate — always responding in the same language as the user's question, remaining polite, professional, and maximally helpful."
+    )
+
+    CHAT_FORMAT = (
+        "{{ bos_token if bos_token is defined else '' }}"
+        "{% for message in messages %}"
+            "{% if message.role == 'system' %}"
+                "{{ message.content }}"
+            "{% elif message.role == 'user' %}"
+                "USER: "
+                "{% if message.content is string %}"
+                    "{{ message.content }}"
+                "{% elif message.content is iterable %}"
+                    "{% for content in message.content %}"
+                        "{% if content.type == 'image_url' %}"
+                            "{{ content.image_url if content.image_url is string else content.image_url.url }}"
+                        "{% elif content.type == 'audio_url' %}"
+                            "{{ content.audio_url if content.audio_url is string else content.audio_url.url }}"
+                        "{% elif content.type == 'input_audio' %}"
+                            "{% if content.input_audio is string %}"
+                                "{{ content.input_audio }}"
+                            "{% else %}"
+                                "data:audio/{{ content.input_audio.format }};base64,{{ content.input_audio.data }}"
+                            "{% endif %}"
+                        "{% elif content.type == 'video_url' %}"
+                            "{{ content.video_url if content.video_url is string else content.video_url.url }}"
+                        "{% elif content.type == 'video' %}"
+                            "{{ content.video if content.video is string else content.video.url }}"
+                        "{% elif content.type == 'text' %}"
+                            "{{ content.text }}"
+                        "{% endif %}"
+                    "{% endfor %}"
+                "{% endif %}"
+
+            "{% elif message.role == 'assistant' and message.content is not none %}"
+                "ASSISTANT: {{ message.content }}"
+            "{% endif %}"
+            "{{ \"\n\" }}"
+        "{% endfor %}"
+
+        "{% if eos_token is defined %}"
+            "{{ eos_token }}"
+        "{% endif %}"
+
+        "{% if add_generation_prompt %}"
+            "ASSISTANT: "
+        "{% endif %}"
+    )
+
+    KNOWN_MEDIA_TAGS: List[str] = []
+
+    def __init__(
+        self,
+        mmproj_path: Optional[str] = None,
+        verbose: bool = True,
+        use_gpu: bool = True,
+        image_min_tokens: int = -1,
+        image_max_tokens: int = -1,
+        chat_template_override: Optional[str] = None,
+        batch_max_tokens: int = 1024,
+        extra_template_arguments: Optional[Dict[str, Any]] = None,
+        mtmd_helper_init_opt: Optional[Any] = None,
+        video_fps_target: Optional[float] = None,
+        video_ffmpeg_bin_dir: Optional[Union[str, os.PathLike[str]]] = None,
+        video_timestamp_interval_ms: Optional[int] = None,
+        **kwargs
+    ):
+
+        super().__init__(
+            mmproj_path=mmproj_path,
+            verbose=verbose,
+            use_gpu=use_gpu,
+            image_min_tokens=image_min_tokens,
+            image_max_tokens=image_max_tokens,
+            batch_max_tokens=batch_max_tokens,
+            mtmd_helper_init_opt=mtmd_helper_init_opt,
+            video_fps_target=video_fps_target,
+            video_ffmpeg_bin_dir=video_ffmpeg_bin_dir,
+            video_timestamp_interval_ms=video_timestamp_interval_ms,
+            **kwargs,
+        )
+
+        if extra_template_arguments is not None and not isinstance(extra_template_arguments, dict):
+            raise TypeError(
+                f"{self.log_prefix}(__init__): `extra_template_arguments` must be a dict."
+            )
+
+        # Preserve subclass attributes
+        if not hasattr(self, "chat_format"):
+            self.chat_format = None
+
+        self.chat_format_override = chat_template_override
+        self.extra_template_arguments: dict[str, Any] = dict(extra_template_arguments or {})
+
+        self.chat_template = None
+        self._chat_format_parser_tags = []
+        self._template_initialized = False
+
+        # Pre-compile Jinja template
+        if self.chat_format is None:
+            if self.chat_format_override is not None:
+                self.chat_format = self.chat_format_override
+            else:
+                self.chat_format = self.CHAT_FORMAT
+
+        self._change_chat_template(self.chat_format)
+
+    def _change_chat_template(self, new_template: str):
+        self.chat_template = ImmutableSandboxedEnvironment(
+            trim_blocks=True,
+            lstrip_blocks=True
+        ).from_string(new_template)
+
+    def _init_mtmd_context(self, llama_model: llama_core.Llama):
+        if self.mtmd_ctx is not None:
+            return
+
+        # Cache the model's eos token and bos token
+        self.mtmd_eos_token=llama_model.detokenize([llama_model.token_eos()]).decode('utf-8', errors='ignore')
+        self.mtmd_bos_token=llama_model.detokenize([llama_model.token_bos()]).decode('utf-8', errors='ignore')
+
+        super()._init_mtmd_context(llama_model)
+
+    def close(self) -> None:
         self.chat_format = None
         self.chat_template = None
         self.chat_template_override = None
         self._template_initialized = False
         self._chat_format_parser_tags = []
-
-        if getattr(self, "_exit_stack", None) is not None and hasattr(self._exit_stack, "close"):
-            self._exit_stack.close()
-            self._exit_stack = None
-
-    def __del__(self) -> None:
-        self.close()
+        super().close()
 
     def _get_media_url(
         self,
@@ -545,75 +927,6 @@ class MTMDChatHandler:
                         )
 
         return media_items
-
-    def _create_bitmap_from_bytes(self, media_bytes: bytes):
-        """
-        Constructs an mtmd_bitmap structure from a raw byte buffer containing media data.
-
-        Supported formats:
-          - Images (via stb_image): jpg, png, bmp, etc.
-          - Audio (via miniaudio): wav, mp3, flac.
-          - Video: depends on whether MTMD_VIDEO was enabled at build time.
-
-        Note:
-          - Media types (Image vs. Audio) are auto-detected by the C++ backend using magic bytes.
-          - The underlying C++ helper function is thread-safe, making it suitable for concurrent preprocessing.
-
-        Args:
-            media_bytes (bytes): The raw byte content of the media file.
-
-        Returns:
-            bitmap: mtmd_bitmap *
-            video_ctx: mtmd_helper_video * or NULL
-        """
-        if self.mtmd_ctx is None:
-            raise ValueError(f"{self.log_prefix}(_create_bitmap_from_bytes): mtmd context not initialized.")
-
-        if not media_bytes:
-            raise ValueError(f"{self.log_prefix}(_create_bitmap_from_bytes): empty media bytes.")
-
-        buf = (ctypes.c_uint8 * len(media_bytes)).from_buffer_copy(media_bytes)
-
-        wrapper = self._mtmd_cpp.mtmd_helper_bitmap_init_from_buf(
-            self.mtmd_ctx,
-            buf,
-            len(media_bytes),
-            False,
-            self._mtmd_helper_init_opt,
-        )
-
-        if not wrapper.bitmap:
-            if wrapper.video_ctx:
-                self._mtmd_cpp.mtmd_helper_video_free(wrapper.video_ctx)
-
-            raise ValueError(
-                f"{self.log_prefix}(_create_bitmap_from_bytes): "
-                "Failed to load media from bytes "
-                "(unsupported media format, corrupted data, or missing helper support)."
-            )
-
-        return wrapper.bitmap, wrapper.video_ctx
-
-    def _is_text_chunk(self, chunk_type: int) -> bool:
-        """Return True if `chunk_type` is the MTMD text chunk type enum value."""
-        return (
-            chunk_type
-            == self._mtmd_cpp.mtmd_input_chunk_type.MTMD_INPUT_CHUNK_TYPE_TEXT
-        )
-
-    def _is_image_chunk(self, chunk_type: int) -> bool:
-        """Return True if `chunk_type` is the MTMD image chunk type enum value."""
-        return (
-            chunk_type
-            == self._mtmd_cpp.mtmd_input_chunk_type.MTMD_INPUT_CHUNK_TYPE_IMAGE
-        )
-
-    def _is_audio_chunk(self, chunk_type: int) -> bool:
-        """Return True if `chunk_type` is the MTMD audio chunk type enum value."""
-        return (
-            chunk_type
-            == self._mtmd_cpp.mtmd_input_chunk_type.MTMD_INPUT_CHUNK_TYPE_AUDIO
-        )
 
     def _render_mtmd_prompt(
         self,
@@ -865,22 +1178,6 @@ class MTMDChatHandler:
             # Transfer ownership only after success; caller-provided chunks are borrowed.
             cleanup.pop_all()
             return chunks
-
-    def _free_mtmd_resources(self, chunks=None, bitmaps=None, videos=None):
-        """Release all owned resources, even if an individual free raises."""
-        with ExitStack() as cleanup:
-            # Callbacks run in reverse order: chunks, bitmaps, then videos.
-            for resources, free in (
-                (videos, self._mtmd_cpp.mtmd_helper_video_free),
-                (bitmaps, self._mtmd_cpp.mtmd_bitmap_free),
-            ):
-                if resources:
-                    for resource in reversed(resources):
-                        cleanup.callback(free, resource)
-                    # Transfer ownership before freeing so outer cleanup cannot retry these pointers.
-                    resources.clear()
-            if chunks is not None:
-                cleanup.callback(self._mtmd_cpp.mtmd_input_chunks_free, chunks)
 
     def _process_mtmd_prompt(
         self,
@@ -1422,256 +1719,6 @@ class MTMDChatHandler:
                 tool_name, completion_or_chunks, stream
             )
         return _convert_completion_to_chat(completion_or_chunks, stream=stream)
-
-    def load_media(self, media_url: str, media_type: str) -> bytes:
-        """
-        Unified dispatcher for loading media payloads.
-        Routes the URL/URI to the specific image, audio, or video processor based on the media_type.
-        """
-        if media_type == "image":
-            return self._load_image(media_url)
-
-        elif media_type == "audio":
-            audio_bytes = self._load_bytes(media_url, timeout=15, kind="audio")
-            try:
-                self.detect_audio_format(audio_bytes)
-            except ValueError as e:
-                raise ValueError(f"{self.log_prefix}(load_media): {e}")
-            return audio_bytes
-
-        elif media_type == "video":
-            return self._load_bytes(media_url, timeout=30, kind="video")
-
-        else:
-            raise ValueError(f"{self.log_prefix}(load_media): Unknown media type '{media_type}'")
-
-    @staticmethod
-    def detect_audio_format(audio_bytes: bytes) -> str:
-        """
-        Pure utility function: Detects the audio format from magic bytes.
-        Strictly translated from llama.cpp's `is_audio_file` to ensure 100% compatibility
-        and avoid false positives (e.g., AVI files disguised as RIFF).
-        """
-        length = len(audio_bytes)
-
-        if length < 12:
-            raise ValueError("Audio data is corrupted or too small (less than 12 bytes).")
-
-        # RIFF & WAVE magic bytes verification
-        is_wav = audio_bytes.startswith(b"RIFF") and audio_bytes[8:12] == b"WAVE"
-
-        # ID3 metadata or MPEG sync word verification
-        is_mp3 = length >= 3 and (
-            audio_bytes.startswith(b"ID3") or
-            (audio_bytes[0] == 0xFF and (audio_bytes[1] & 0xE0) == 0xE0)
-        )
-
-        # FLAC magic bytes verification
-        is_flac = audio_bytes.startswith(b"fLaC")
-
-        if is_wav:
-            return "wav"
-        elif is_mp3:
-            return "mp3"
-        elif is_flac:
-            return "flac"
-        else:
-            raise ValueError(
-                "Unsupported audio format detected via magic bytes. "
-                "The underlying C++ miniaudio backend ONLY supports WAV, MP3, and FLAC."
-            )
-
-    DEFAULT_HTTP_HEADERS = {
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/148.0.0.0 Safari/537.36"
-        ),
-    }
-
-    @staticmethod
-    def _load_bytes(media_url: str, timeout: int = 15, kind: str = "media") -> bytes:
-        """
-        Load raw bytes from a data URI, local file path, or remote HTTP/HTTPS URL.
-        """
-        media_bytes = b""
-
-        # 1. Handle data URI
-        if media_url.strip().startswith("data:"):
-            comma_pos = media_url.find(",")
-            if comma_pos == -1:
-                raise ValueError("Invalid data URI: missing comma separator")
-
-            base64_data = media_url[comma_pos + 1:]
-            media_bytes = base64.b64decode(base64_data)
-
-        # 2. Handle local file path
-        elif os.path.exists(media_url):
-            with open(media_url, "rb") as f:
-                media_bytes = f.read()
-
-        # 3. Handle remote URL via HTTP/HTTPS
-        else:
-            req = urllib.request.Request(
-                media_url,
-                headers=MTMDChatHandler.DEFAULT_HTTP_HEADERS,
-            )
-            try:
-                with urllib.request.urlopen(req, timeout=timeout) as f:
-                    media_bytes = f.read()
-            except (URLError, HTTPError) as e:
-                raise ConnectionError(f"Failed to download {kind} from {media_url}: {e}")
-
-        if not media_bytes:
-            raise ValueError(f"Empty {kind} data received")
-
-        return media_bytes
-
-    @staticmethod
-    def _load_image(image_url: str) -> bytes:
-        """
-        Load an image from either a URL or a data URI and return it as JPEG bytes.
-
-        Supports:
-        - Remote images via HTTP/HTTPS (with proper User-Agent)
-        - Data URIs (base64-encoded, e.g., data:image/png;base64,...)
-        - Images with alpha channel (PNG, WebP, etc.) → automatically composites on white/black background
-        - Any format that Pillow can open. See: https://pillow.readthedocs.io/en/stable/handbook/image-file-formats.html
-
-        Returns:
-            JPEG-encoded bytes (quality=95) in RGB mode, suitable for most vision models.
-        """
-        # 1. Load image bytes from image_url
-        image_bytes = MTMDChatHandler._load_bytes(
-            image_url,
-            timeout=15,
-            kind="image",
-        )
-
-        # 2. Check if image_bytes is empty.
-        if not image_bytes:
-            raise ValueError("Empty image data received")
-
-        # 3. Open image with Pillow
-        try:
-            from PIL import Image, ImageStat
-        except ImportError:
-            raise ImportError("Pillow is required for image processing. Install with: pip install pillow")
-
-        import io
-        image = Image.open(io.BytesIO(image_bytes))
-
-        # 4. Handle transparency (RGBA, LA, P with transparency, etc.)
-        if image.mode in ("RGBA", "LA", "PA") or (image.mode == "P" and "transparency" in image.info):
-            # Use alpha channel as mask
-            if image.mode == "P":
-                image = image.convert("RGBA")
-
-            alpha = image.split()[-1]  # Last channel is alpha
-            # Compute average brightness of visible (non-transparent) pixels
-            stat = ImageStat.Stat(image.convert("L"), mask=alpha)
-
-            # Choose background: white for dark content, black for bright content
-            bg_color = (255, 255, 255)  # white
-            if stat.count[0] > 0 and stat.mean[0] > 127:
-                bg_color = (0, 0, 0)  # black
-
-            background = Image.new("RGB", image.size, bg_color)
-            background.paste(image, mask=alpha)
-            image = background
-
-        # 5. Ensure RGB mode for formats like CMYK, palette, etc.
-        elif image.mode != "RGB":
-            image = image.convert("RGB")
-
-        # 6. Save as high-quality JPEG, suitable for most vision models.
-        output = io.BytesIO()
-        image.save(output, format="JPEG", quality=95, optimize=True, progressive=True)
-        return output.getvalue()
-
-    @classmethod
-    def from_pretrained(
-        cls,
-        repo_id: str,
-        filename: Optional[str],
-        local_dir: Optional[Union[str, os.PathLike[str]]] = None,
-        local_dir_use_symlinks: Union[bool, Literal["auto"]] = "auto",
-        cache_dir: Optional[Union[str, os.PathLike[str]]] = None,
-        **kwargs: Any,
-    ) -> "MTMDChatHandler":
-        import fnmatch
-        from pathlib import Path
-
-        try:
-            from huggingface_hub import hf_hub_download, HfFileSystem  # type: ignore
-            from huggingface_hub.utils import validate_repo_id  # type: ignore
-        except ImportError:
-            raise ImportError(
-                "Llama.from_pretrained requires the huggingface_hub package. "
-                "You can install it with `pip install --upgrade huggingface_hub`."
-            )
-
-        validate_repo_id(repo_id)
-
-        hffs = HfFileSystem()
-
-        files = [
-            file["name"] if isinstance(file, dict) else file
-            for file in hffs.ls(repo_id)  # type: ignore
-        ]
-
-        # split each file into repo_id, subfolder, filename
-        file_list: List[str] = []
-        for file in files:
-            rel_path = Path(file).relative_to(repo_id)
-            file_list.append(str(rel_path))
-
-        matching_files = [file for file in file_list if fnmatch.fnmatch(file, filename)]  # type: ignore
-
-        if len(matching_files) == 0:
-            raise ValueError(
-                f"No file found in {repo_id} that match {filename}\n\n"
-                f"Available Files:\n{json.dumps(file_list)}"
-            )
-
-        if len(matching_files) > 1:
-            raise ValueError(
-                f"Multiple files found in {repo_id} matching {filename}\n\n"
-                f"Available Files:\n{json.dumps(files)}"
-            )
-
-        (matching_file,) = matching_files
-
-        subfolder = str(Path(matching_file).parent)
-        filename = Path(matching_file).name
-
-        # download the file
-        hf_hub_download(
-            repo_id=repo_id,
-            filename=filename,
-            subfolder=subfolder,
-            local_dir=cast(Union[str, Path, None], local_dir),
-            local_dir_use_symlinks=local_dir_use_symlinks,
-            cache_dir=cast(Union[str, Path, None], cache_dir),
-        )
-
-        if local_dir is None:
-            model_path = hf_hub_download(
-                repo_id=repo_id,
-                filename=filename,
-                subfolder=subfolder,
-                local_dir=local_dir,
-                local_dir_use_symlinks=local_dir_use_symlinks,
-                cache_dir=cast(Union[str, Path, None], cache_dir),
-                local_files_only=True,
-            )
-        else:
-            model_path = os.path.join(local_dir, filename)
-
-        return cls(
-            mmproj_path=model_path,
-            **kwargs,
-        )
 
 # Generic template-driven MTMD handler.
 class GenericMTMDChatHandler(MTMDChatHandler):
