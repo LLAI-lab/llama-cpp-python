@@ -2172,6 +2172,7 @@ def llama_adapter_lora_init(
     "llama_adapter_lora_init_from_file_ptr",
     [llama_model_p_ctypes, ctypes.c_void_p],
     llama_adapter_lora_p_ctypes,
+    required=False,
 )
 def llama_adapter_lora_init_from_file_ptr(
     model: llama_model_p, file: ctypes.c_void_p, /
