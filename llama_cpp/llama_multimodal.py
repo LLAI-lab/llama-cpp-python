@@ -3,11 +3,16 @@ from __future__ import annotations
 import base64
 import ctypes
 import json
+import io
+import math
 import os
 import sys
+import threading
 import zlib
+import wave
 
 from contextlib import ExitStack
+from dataclasses import dataclass
 from typing_extensions import Self
 from typing import (
     Any,
@@ -39,7 +44,8 @@ from llama_cpp.llama_chat_format import (
     _convert_completion_to_chat,
     _convert_completion_to_chat_function,
     _grammar_for_response_format,
-    ImmutableSandboxedEnvironment
+    ImmutableSandboxedEnvironment,
+    Jinja2ChatFormatter,
 )
 
 class MTMDBaseHandler:
@@ -57,6 +63,7 @@ class MTMDBaseHandler:
         video_fps_target: Optional[float] = None,
         video_ffmpeg_bin_dir: Optional[Union[str, os.PathLike[str]]] = None,
         video_timestamp_interval_ms: Optional[int] = None,
+        flash_attn: Optional[bool] = None,
         **kwargs
     ):
 
@@ -99,6 +106,9 @@ class MTMDBaseHandler:
         self.image_max_tokens = image_max_tokens
         self.batch_max_tokens = batch_max_tokens
         self.use_gpu = use_gpu
+        if flash_attn is not None and not isinstance(flash_attn, bool):
+            raise TypeError("flash_attn must be bool or None")
+        self.flash_attn = flash_attn
 
         import llama_cpp.mtmd_cpp as mtmd_cpp
         self._mtmd_cpp = mtmd_cpp
@@ -195,7 +205,12 @@ class MTMDBaseHandler:
         self.mctx_params.device = None
         self.mctx_params.print_timings = self.verbose
         self.mctx_params.n_threads = llama_model.n_threads
-        self.mctx_params.flash_attn_type = self._mtmd_cpp.clip_flash_attn_type.CLIP_FLASH_ATTN_TYPE_AUTO
+        flash_types = self._mtmd_cpp.clip_flash_attn_type
+        self.mctx_params.flash_attn_type = (
+            flash_types.CLIP_FLASH_ATTN_TYPE_AUTO if self.flash_attn is None else
+            flash_types.CLIP_FLASH_ATTN_TYPE_ENABLED if self.flash_attn else
+            flash_types.CLIP_FLASH_ATTN_TYPE_DISABLED
+        )
         self.mctx_params.warmup = True
         if self.image_min_tokens > 0:
             self.mctx_params.image_min_tokens = self.image_min_tokens
@@ -603,6 +618,300 @@ class MTMDBaseHandler:
 
 
 
+@dataclass(frozen=True)
+class GeneratedAudio:
+    """Owned mono audio data. Raw PCM uses native-endian float32 samples."""
+
+    data: bytes
+    sample_rate: int
+    n_samples: int
+    format: Literal["wav", "pcm_f32"]
+    finish_reason: Literal["stop", "length"]
+    channels: int = 1
+
+    @property
+    def duration(self) -> float:
+        return self.n_samples / self.sample_rate
+
+    def save(self, path: Union[str, os.PathLike[str]]) -> None:
+        """Write the existing bytes without converting the audio format."""
+        with open(path, "wb") as output:
+            output.write(self.data)
+
+
+class MTMDAudioGenerator(MTMDBaseHandler):
+    """Non-streaming speech synthesis using the vendor audio generation helper.
+
+    Use a dedicated Llama with embeddings=True and pooling_type=NONE. Requests
+    clear its KV and Python token state. Do not use or close that Llama from
+    another thread during synthesis. Close this generator before the Llama.
+
+    flash_attn controls mmproj attention independently of the Llama backbone:
+    None selects AUTO (default), True enables it, and False disables it.
+    """
+
+    def __init__(self, *args, flash_attn: Optional[bool] = None, **kwargs):
+        self._request_lock = threading.Lock()
+        self._closed = False
+        self._bound_llama = None
+        self._audio_ctx = None
+        super().__init__(*args, flash_attn=flash_attn, **kwargs)
+
+    def __enter__(self) -> Self:
+        if self._closed:
+            raise RuntimeError("Audio generator is closed")
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback) -> None:
+        self.close()
+
+    def close(self) -> None:
+        lock = getattr(self, "_request_lock", None)
+        if lock is None:
+            super().close()
+            return
+        if not lock.acquire(blocking=False):
+            raise RuntimeError("Cannot close audio generator during synthesis")
+        try:
+            self._closed = True
+            try:
+                super().close()
+            finally:
+                self._audio_ctx = None
+                self._bound_llama = None
+        finally:
+            lock.release()
+
+    def _init_mtmd_context(self, llama_model: llama_core.Llama):
+        if self._bound_llama is not None and self._bound_llama is not llama_model:
+            raise ValueError("Audio generator is already bound to a different Llama")
+        self._bound_llama = llama_model
+        super()._init_mtmd_context(llama_model)
+
+    def _create_audio_sampler(self, llama, *, seed, temperature, top_k, top_p, min_p, repeat_penalty):
+        from ._internals import LlamaSamplingContext, LlamaSamplingParams
+
+        return LlamaSamplingContext(
+            params=LlamaSamplingParams(
+                seed=seed, temp=temperature, top_k=top_k, top_p=top_p,
+                min_p=min_p, penalty_repeat=repeat_penalty,
+                penalty_last_n=llama.n_ctx(),
+            ),
+            model=llama._model,
+        )
+
+    @staticmethod
+    def _validate_audio(data: bytes, response_format: str, rate: int, samples: int) -> None:
+        """Reject malformed buffers and clearly invalid signals, not low volume speech."""
+        import numpy as np
+
+        if samples <= 0:
+            raise RuntimeError("TTS returned empty audio")
+        if response_format == "wav":
+            try:
+                with wave.open(io.BytesIO(data), "rb") as wav:
+                    if (wav.getnchannels(), wav.getsampwidth(), wav.getframerate(), wav.getnframes()) != (1, 2, rate, samples):
+                        raise RuntimeError("TTS WAV metadata does not match the output metadata")
+                    payload = wav.readframes(samples)
+                if len(payload) != samples * 2:
+                    raise RuntimeError("TTS returned truncated WAV samples")
+                signal = np.frombuffer(payload, dtype="<i2").astype(np.float32) / 32768.0
+            except (wave.Error, EOFError) as exc:
+                raise RuntimeError("TTS returned malformed WAV data") from exc
+        else:
+            if len(data) != samples * 4:
+                raise RuntimeError("TTS PCM byte length does not match the sample count")
+            signal = np.frombuffer(data, dtype=np.float32)
+        if not np.isfinite(signal).all():
+            raise RuntimeError("TTS returned non-finite audio samples (NaN or infinity)")
+        if np.max(np.abs(signal)) > 1.0:
+            raise RuntimeError("TTS returned out-of-range PCM samples")
+        if np.all(signal == signal[0]) or np.mean(np.abs(signal) >= 0.999) >= 0.99:
+            raise RuntimeError(
+                "TTS returned invalid audio: constant signal or >=99% full-scale clipping. "
+                "Check the model files and native backend build."
+            )
+
+    @staticmethod
+    def _check_audio_abort(llama: llama_core.Llama) -> None:
+        if llama._abort_event.is_set():
+            raise InterruptedError("Speech synthesis aborted")
+
+    def _check_audio_result(self, llama: llama_core.Llama, result: int, stage: str) -> None:
+        self._check_audio_abort(llama)
+        if result != 0:
+            raise RuntimeError(f"TTS {stage} failed (code {result})")
+
+    def _decode_audio(self, llama: llama_core.Llama, n_batch: int, sampler, max_frames: int) -> Literal["stop", "length"]:
+        mtmd = self._mtmd_cpp
+        while True:
+            self._check_audio_abort(llama)
+            remaining = mtmd.mtmd_helper_gen_audio_step_prompt(self._audio_ctx, n_batch)
+            self._check_audio_abort(llama)
+            if remaining < 0:
+                raise RuntimeError(f"TTS step_prompt failed (code {remaining})")
+            if remaining == 0:
+                break
+        hidden = llama_cpp_lib.llama_get_embeddings_ith(llama._ctx.ctx, -1)
+        if not hidden:
+            raise RuntimeError("TTS prompt returned no hidden state")
+
+        for _ in range(max_frames):
+            self._check_audio_abort(llama)
+            token = llama_cpp_lib.LLAMA_TOKEN_NULL
+            if sampler is not None:
+                token = sampler.sample(llama._ctx, idx=-1)
+                sampler.accept(token, accept_grammar=False)
+            next_hidden = ctypes.POINTER(ctypes.c_float)()
+            stop = ctypes.c_bool(False)
+            self._check_audio_result(llama, mtmd.mtmd_helper_gen_audio_step_gen(
+                self._audio_ctx, token, hidden, ctypes.byref(next_hidden), ctypes.byref(stop),
+            ), "step_gen")
+            if stop.value:
+                return "stop"
+            if not next_hidden:
+                raise RuntimeError("TTS step_gen returned no hidden state without stopping")
+            hidden = next_hidden
+
+        return "length"
+
+    def _get_audio_output(
+        self, llama: llama_core.Llama, response_format: Literal["wav", "pcm_f32"],
+        finish_reason: Literal["stop", "length"],
+    ) -> GeneratedAudio:
+        mtmd = self._mtmd_cpp
+        rate, data, size, samples = ctypes.c_int32(), ctypes.c_char_p(), ctypes.c_size_t(), ctypes.c_int64()
+        self._check_audio_result(llama, mtmd.mtmd_helper_gen_audio_get_output(
+            self._audio_ctx, ctypes.byref(rate), ctypes.byref(data), ctypes.byref(size), ctypes.byref(samples),
+        ), "get_output")
+        if rate.value <= 0 or samples.value < 0 or (size.value and not data):
+            raise RuntimeError("TTS returned invalid audio metadata or buffer")
+        audio_data = ctypes.string_at(data, size.value) if size.value else b""
+        self._validate_audio(audio_data, response_format, rate.value, samples.value)
+        return GeneratedAudio(
+            data=audio_data,
+            sample_rate=rate.value, n_samples=samples.value,
+            format=response_format, finish_reason=finish_reason,
+        )
+
+    def create_speech(
+        self,
+        *,
+        llama: llama_core.Llama,
+        text: str,
+        language: Optional[str] = None,
+        speaker_reference: Optional[Union[str, os.PathLike[str], bytes]] = None,
+        response_format: Literal["wav", "pcm_f32"] = "wav",
+        max_frames: int = 512,
+        seed: Optional[int] = None,
+        temperature: float = 0.8,
+        top_k: int = 40,
+        top_p: float = 0.95,
+        min_p: float = 0.05,
+        repeat_penalty: float = 1.05,
+    ) -> GeneratedAudio:
+        """Synthesize complete audio and return a Python-owned result.
+
+        Qwen3-TTS uses the sampling options; top_k/top_p also reach its code
+        predictor (top_k <= 0 selects the helper default for that stage).
+        Pocket TTS requires speaker_reference, ignores sampling options except
+        seed, and selects language and flow settings from its weights.
+        References accept encoded audio bytes, local paths, URLs or data URIs.
+        max_frames limits helper generation steps, not text tokens or seconds.
+        Llama.abort() interrupts synthesis with InterruptedError.
+        """
+        if not self._request_lock.acquire(blocking=False):
+            raise RuntimeError("Audio generator is already synthesizing speech")
+        try:
+            if self._closed:
+                raise RuntimeError("Audio generator is closed")
+            if not isinstance(text, str) or not text.strip() or "\x00" in text:
+                raise ValueError("text must be a non-empty string without NUL characters")
+            if language is not None and (
+                not isinstance(language, str) or not language.strip() or "\x00" in language
+            ):
+                raise ValueError("language must be a non-empty string without NUL characters")
+            if response_format not in ("wav", "pcm_f32"):
+                raise ValueError("response_format must be 'wav' or 'pcm_f32'")
+            if isinstance(max_frames, bool) or not isinstance(max_frames, int) or max_frames <= 0:
+                raise ValueError("max_frames must be a positive integer")
+            if seed is not None and (isinstance(seed, bool) or not isinstance(seed, int) or not 0 <= seed <= 0xFFFFFFFF):
+                raise ValueError("seed must be a uint32 integer or None")
+            if not isinstance(top_k, int) or isinstance(top_k, bool) or not -(2**31) <= top_k < 2**31:
+                raise ValueError("top_k must be an int32 integer")
+            if not all(math.isfinite(v) for v in (temperature, top_p, min_p, repeat_penalty)):
+                raise ValueError("Sampling values must be finite")
+            if not 0 < top_p <= 1 or not 0 <= min_p <= 1 or repeat_penalty <= 0:
+                raise ValueError("Invalid top_p, min_p or repeat_penalty")
+            if not getattr(llama._ctx, "ctx", None) or llama.context_params is None:
+                raise RuntimeError("Llama is closed")
+            if not llama.context_params.embeddings or llama._ctx.pooling_type() != llama_cpp_lib.LLAMA_POOLING_TYPE_NONE:
+                raise ValueError("TTS requires Llama(embeddings=True, pooling_type=LLAMA_POOLING_TYPE_NONE)")
+            n_batch = min(llama._ctx.n_batch(), self.batch_max_tokens)
+            if n_batch <= 0:
+                raise ValueError("TTS batch size must be positive")
+
+            self._init_mtmd_context(llama)
+            mtmd = self._mtmd_cpp
+            info = mtmd.mtmd_gen_audio_get_info(self.mtmd_ctx)
+            types = mtmd.mtmd_gen_audio_type
+            is_qwen = info.type == types.MTMD_GEN_AUDIO_TYPE_QWEN3TTS
+            is_pocket = info.type == types.MTMD_GEN_AUDIO_TYPE_POCKETTTS
+            if not (is_qwen or is_pocket):
+                raise ValueError("mmproj does not provide a supported TTS pipeline")
+            if is_pocket and speaker_reference is None:
+                raise ValueError("Pocket TTS requires speaker_reference")
+            if is_pocket and language is not None:
+                raise ValueError("Pocket TTS language is determined by its weights")
+
+            with ExitStack() as cleanup:
+                speaker = None
+                if speaker_reference is not None:
+                    if not self.is_support_audio:
+                        raise ValueError("mmproj does not support reference audio input")
+                    payload = speaker_reference if isinstance(speaker_reference, bytes) else self.load_media(os.fspath(speaker_reference), "audio")
+                    self.detect_audio_format(payload)
+                    speaker, video = self._create_bitmap_from_bytes(payload)
+                    cleanup.callback(self._free_mtmd_resources, bitmaps=[speaker], videos=[video] if video else [])
+                    if video or not mtmd.mtmd_bitmap_is_audio(speaker):
+                        raise ValueError("speaker_reference must contain audio")
+
+                if self._audio_ctx is None:
+                    audio_ctx = mtmd.mtmd_helper_gen_audio_init(llama._ctx.ctx, self.mtmd_ctx)
+                    if not audio_ctx:
+                        raise RuntimeError("Failed to initialize TTS helper")
+                    self._audio_ctx = audio_ctx
+                    self._exit_stack.callback(mtmd.mtmd_helper_gen_audio_free, audio_ctx)
+
+                actual_seed = llama_cpp_lib.LLAMA_DEFAULT_SEED if seed is None else seed
+                sampler = None
+                if is_qwen:
+                    sampler = self._create_audio_sampler(
+                        llama, seed=actual_seed, temperature=temperature, top_k=top_k,
+                        top_p=top_p, min_p=min_p, repeat_penalty=repeat_penalty,
+                    )
+                    cleanup.callback(sampler.close)
+
+                llama._native_abort_flag.value = False
+                llama._abort_event.clear()
+                cleanup.callback(llama.reset)
+                cleanup.callback(mtmd.mtmd_helper_gen_audio_reset, self._audio_ctx)
+                llama.reset()
+                prompt = text.encode("utf-8")
+                inp = mtmd.mtmd_helper_gen_audio_inp(
+                    seq_id=0, prompt=prompt, prompt_len=len(prompt), speaker_ref=speaker,
+                    lang=language.encode("utf-8") if language is not None else None,
+                    top_k=top_k, top_p=top_p, seed=actual_seed,
+                    out_type=(mtmd.mtmd_helper_gen_audio_outtype.MTMD_HELPER_GEN_AUDIO_OUTTYPE_WAV
+                              if response_format == "wav" else mtmd.mtmd_helper_gen_audio_outtype.MTMD_HELPER_GEN_AUDIO_OUTTYPE_PCM),
+                )
+                self._check_audio_result(llama, mtmd.mtmd_helper_gen_audio_set_input(self._audio_ctx, ctypes.byref(inp)), "set_input")
+                finish_reason = self._decode_audio(llama, n_batch, sampler, max_frames)
+                return self._get_audio_output(llama, response_format, finish_reason)
+        finally:
+            self._request_lock.release()
+
+
 class MTMDChatHandler(MTMDBaseHandler):
     DEFAULT_SYSTEM_MESSAGE: Optional[str] = (
 "You are an exceptionally capable, precise, and helpful multimodal AI assistant that excels at deeply understanding and richly describing images, charts, diagrams, text in images, scenes, and any visual content, "
@@ -714,10 +1023,13 @@ class MTMDChatHandler(MTMDBaseHandler):
         self._change_chat_template(self.chat_format)
 
     def _change_chat_template(self, new_template: str):
-        self.chat_template = ImmutableSandboxedEnvironment(
+        environment = ImmutableSandboxedEnvironment(
             trim_blocks=True,
             lstrip_blocks=True
-        ).from_string(new_template)
+        )
+        environment.globals["raise_exception"] = Jinja2ChatFormatter.raise_exception
+        environment.globals["strftime_now"] = Jinja2ChatFormatter.strftime_now
+        self.chat_template = environment.from_string(new_template)
 
     def _init_mtmd_context(self, llama_model: llama_core.Llama):
         if self.mtmd_ctx is not None:
@@ -1444,14 +1756,28 @@ class MTMDChatHandler(MTMDBaseHandler):
             add_generation_prompt=add_generation_prompt,
         )
 
+        prefill_started = False
         try:
             if self.verbose:
                 print(f"{self.log_prefix}(__call__): Prepared virtual token ledger of length {len(full_prompt_ids)}.", file=sys.stderr)
 
+            if llama.speculative is not None and not getattr(
+                llama.speculative, "supports_predecoded_media", False
+            ):
+                raise NotImplementedError(
+                    "This speculative engine cannot consume MTMD prefilled prompts; "
+                    "use NGRAM_MAP_K/K4V or disable speculative decoding for this handler"
+                )
+            prefill_started = True
+            llama._last_eval_output_start = 0
+            llama._last_eval_output_count = 0
+            llama._prefilled_prompt = None
+            llama._restored_logits = None
+
             # 3. KV Cache Synchronization & State Rollback
             # Compares the virtual ledger with physical history to prevent Cache Poisoning.
             current_history = llama.input_ids[:llama.n_tokens].tolist()
-            longest_prefix = llama.longest_token_prefix(current_history, full_prompt_ids, self.verbose)
+            longest_prefix = llama.longest_token_prefix(current_history, full_prompt_ids[:-1], self.verbose)
 
             if longest_prefix < llama.n_tokens:
                 if llama.is_hybrid and llama._hybrid_cache_mgr is not None:
@@ -1460,7 +1786,7 @@ class MTMDChatHandler(MTMDBaseHandler):
                             print(f"{self.log_prefix}(__call__): Hybrid prefix mismatch (matched {longest_prefix}/{llama.n_tokens}). "
                                 f"Searching for nearest checkpoint...", file=sys.stderr)
 
-                        best_ckpt = llama._hybrid_cache_mgr.find_best_checkpoint(full_prompt_ids, seq_id=0)
+                        best_ckpt = llama._hybrid_cache_mgr.find_best_checkpoint(full_prompt_ids[:-1], seq_id=0)
                         if best_ckpt and llama._hybrid_cache_mgr.restore_checkpoint(best_ckpt, seq_id=0):
                             llama.n_tokens = best_ckpt.pos
                             if self.verbose:
@@ -1468,19 +1794,17 @@ class MTMDChatHandler(MTMDBaseHandler):
                         else:
                             if self.verbose:
                                 print(f"{self.log_prefix}(__call__): No suitable checkpoint found or restore failed. Clearing hybrid cache entirely.", file=sys.stderr)
-                            llama._hybrid_cache_mgr.clear()
-                            llama._ctx.memory_clear(True)
-                            llama.n_tokens = 0
+                            llama.reset()
                     else:
                         if self.verbose:
                             print(f"{self.log_prefix}(__call__): Hybrid cache enabled but max_checkpoints is 0. Clearing cache entirely.", file=sys.stderr)
-                        llama._hybrid_cache_mgr.clear()
-                        llama._ctx.memory_clear(True)
-                        llama.n_tokens = 0
+                        llama.reset()
                 else:
                     if self.verbose:
                         print(f"{self.log_prefix}(__call__): Prefix mismatch. Truncating KV cache from {llama.n_tokens} to {longest_prefix}.", file=sys.stderr)
-                    llama._ctx.memory_seq_rm(0, longest_prefix, -1)
+                    llama._memory_seq_rm_or_raise(
+                        0, longest_prefix, -1, "MTMD prompt rollback"
+                    )
                     llama.n_tokens = longest_prefix
 
             n_past = llama.n_tokens
@@ -1551,11 +1875,16 @@ class MTMDChatHandler(MTMDBaseHandler):
                             if n_discard <= 0:
                                 raise RuntimeError(f"{self.log_prefix}(__call__): Critical Overflow. Not enough unpinned tokens to discard for Context Shift.")
 
+                            if n_past - n_discard + chunk_n_tokens > llama.n_ctx():
+                                raise RuntimeError(f"{self.log_prefix}(__call__): Media chunk cannot fit alongside the retained context.")
+
                             if self.verbose:
                                 print(f"{self.log_prefix}(__call__): OOM risk detected. Shifting multimodal context: keeping {n_keep}, discarding {n_discard}...", file=sys.stderr)
 
                             # Execute physical memory shift
-                            llama._ctx.memory_seq_rm(0, n_keep, n_keep + n_discard)
+                            llama._memory_seq_rm_or_raise(
+                                0, n_keep, n_keep + n_discard, "MTMD context shift"
+                            )
                             llama._ctx.memory_seq_add(0, n_keep + n_discard, n_past, -n_discard)
 
                             # Shift python virtual array to match
@@ -1582,6 +1911,9 @@ class MTMDChatHandler(MTMDBaseHandler):
                     if result != 0:
                         raise ValueError(f"{self.log_prefix}(mtmd_helper_eval_chunk_single): Media evaluation failed with error code {result}.")
 
+                    if not n_past <= new_n_past.value <= llama.n_ctx():
+                        raise ValueError(f"{self.log_prefix}(mtmd_helper_eval_chunk_single): Invalid output position {new_n_past.value}.")
+
                     # Update Ledger with "Negative Reverse Vocabulary" IDs
                     llama.input_ids[n_past : new_n_past.value] = media_id
                     n_past = new_n_past.value
@@ -1601,6 +1933,8 @@ class MTMDChatHandler(MTMDBaseHandler):
 
             # Extract the final, perfectly synchronized prompt sequence
             prompt = llama.input_ids[: llama.n_tokens].tolist()
+            if prompt_evaluated:
+                llama._mark_prefilled_prompt()
 
             # End-of-Turn Checkpoint
             # Anchors the state ONLY after the entire multi-modal turn is processed
@@ -1617,6 +1951,11 @@ class MTMDChatHandler(MTMDBaseHandler):
                     tokens=prompt,
                     seq_id=0
                 )
+        except BaseException:
+            # A helper can commit earlier ubatches before reporting failure.
+            if prefill_started:
+                llama.reset()
+            raise
         finally:
             # Generation no longer needs these resources once prompt evaluation ends.
             self._free_mtmd_resources(chunks, bitmap_cleanup)
@@ -1745,6 +2084,7 @@ class GenericMTMDChatHandler(MTMDChatHandler):
         "<|image|>",
         "<|audio|>",
         "<|video|>",
+        "<|patch|>", # Muse Glimmer used
 
         # LLaVA / LFM / Mistral-style placeholders.
         "<image>",
@@ -3697,84 +4037,157 @@ class Qwen3VLChatHandler(MTMDChatHandler):
     QWEN3_VL_EOS_TOKEN = "<|im_end|>"
 
     CHAT_FORMAT = (
-        "{{- '<|im_start|>system\n' -}}"
-        "{%- if messages[0].content is string and messages[0].role == 'system' -%}"
-            "{{- messages[0].content -}}"
-        "{%- elif messages[0].role == 'system' -%}"
-            "{%- if 'text' in messages[0].content -%}"
-                "{{- messages[0].content.text -}}"
-            "{%- else -%}"
-                "{{- 'You are a helpful assistant.' -}}"
-            "{%- endif -%}"
-        "{%- endif -%}"
-        "{%- if tools -%}"
-            "{{- '\n\n' -}}"
-            "{{- '# Tools\n\nYou may call one or more functions to assist with the user query.\n\nYou are provided with function signatures within <tools></tools> XML tags:\n<tools>' -}}"
-            "{%- for tool in tools -%}"
-                "{{- '\n' -}}"
-                "{{- tool | tojson -}}"
-            "{%- endfor -%}"
-            "{{- '\n</tools>\n\nFor each function call, return a json object with function name and arguments within <tool_call></tool_call> XML tags:\n<tool_call>\n{\"name\": <function-name>, \"arguments\": <arguments-json-object>}\n</tool_call>\n\nYou can also return a response for the user alongside a function call:\nRESPONSE FOR THE USER HERE\n<tool_call>\n{\"name\": <function-name>, \"arguments\": <arguments-json-object>}\n</tool_call>' -}}"
-        "{%- endif -%}"
-        "{{- '<|im_end|>\n' -}}"
         "{%- set image_count = namespace(value=0) -%}"
-        #"{%- set video_count = namespace(value=0) -%}"
-        "{%- for message in messages -%}"
-            "{%- if message.role == 'tool' -%}"
-                "{{- '<|im_start|>user\n<tool_response>\n' -}}"
-            "{%- elif message.role != 'system' -%}"
-                "{{- '<|im_start|>' + message.role + '\n' -}}"
-            "{%- endif -%}"
-            "{%- if message.content is string and message.role != 'system' -%}"
-                "{{- message.content -}}"
-            "{%- elif message.role != 'system' -%}"
-                "{%- for content in message.content -%}"
-                    "{%- if 'image_url' in content -%}"
-                        "{%- set image_count.value = image_count.value + 1 -%}"
+        "{%- set video_count = namespace(value=0) -%}"
+
+        "{%- macro render_content(content, do_vision_count) %}"
+            "{%- if content is string %}"
+                "{{- content }}"
+            "{%- else %}"
+                "{%- for item in content -%}"
+                    " {%- if 'image' in item or 'image_url' in item or item.type == 'image' or item.type == 'image_url' %}"
+                        "{%- if do_vision_count %}"
+                            "{%- set image_count.value = image_count.value + 1 %}"
+                        "{%- endif %}"
                         "{%- if add_vision_id -%}"
                             "{{- 'Picture ' -}}"
                             "{{- image_count.value | string -}}"
                             "{{- ': ' -}}"
                         "{%- endif -%}"
                         "{{- '<|vision_start|>' -}}"
-                        "{%- if content.image_url is string -%}"
-                            "{{- content.image_url -}}"
-                        "{%- else -%}"
-                            "{{- content.image_url.url -}}"
+                        "{%- if 'image' in item -%}"
+                            "{%- if item.image is string -%}"
+                                "{{- item.image -}}"
+                            "{%- else -%}"
+                                "{{- item.image.url -}}"
+                            "{%- endif -%}"
+                        "{%- elif 'image_url' in item -%}"
+                            "{%- if item.image_url is string -%}"
+                                "{{- item.image_url -}}"
+                            "{%- else -%}"
+                                "{{- item.image_url.url -}}"
+                            "{%- endif -%}"
                         "{%- endif -%}"
                         "{{- '<|vision_end|>' -}}"
                     "{%- endif -%}"
-                    # Video not supported yet
-                    "{%- if 'text' in content -%}"
-                        "{{- content.text -}}"
+                    "{%- if 'video_url' in item or 'video' in item -%}"
+                        "{%- if do_vision_count %}"
+                            "{%- set video_count.value = video_count.value + 1 %}"
+                        "{%- endif %}"
+                        "{%- if add_vision_id -%}"
+                            "{{- 'Video ' -}}"
+                            "{{- video_count.value | string -}}"
+                            "{{- ': ' -}}"
+                        "{%- endif -%}"
+                        "{{- '<|vision_start|>' -}}"
+                        "{%- if 'video_url' in item -%}"
+                            "{%- if item.video_url is string -%}"
+                                "{{- item.video_url -}}"
+                            "{%- else -%}"
+                                "{{- item.video_url.url -}}"
+                            "{%- endif -%}"
+                        "{%- endif -%}"
+                        "{%- if 'video' in item -%}"
+                            "{%- if item.video is string -%}"
+                                "{{- item.video -}}"
+                            "{%- else -%}"
+                                "{{- item.video.url -}}"
+                            "{%- endif -%}"
+                        "{%- endif -%}"
+                        "{{- '<|vision_end|>' -}}"
+                    "{%- endif -%}"
+                    "{%- if 'text' in item -%}"
+                        "{{- item.text -}}"
                     "{%- endif -%}"
                 "{%- endfor -%}"
-            "{%- endif -%}"
-            "{%- if message.role == 'assistant' -%}"
-                "{%- if message.tool_calls -%}"
-                    "{%- for tool_call in message.tool_calls -%}"
-                        "{%- if (loop.first and message.content) or (not loop.first) -%}"
-                            "{{- '\n' -}}"
-                        "{%- endif -%}"
-                        "{%- if tool_call.function -%}"
-                            "{%- set tool_call = tool_call.function -%}"
-                        "{%- endif -%}"
-                        "{{- '<tool_call>\n{\"name\": \"' + tool_call.name + '\", \"arguments\": ' -}}"
-                        "{%- if tool_call.arguments is string -%}"
-                            "{{- tool_call.arguments -}}"
-                        "{%- else -%}"
-                            "{{- tool_call.arguments | tojson -}}"
-                        "{%- endif -%}"
-                        "{{- '}\n</tool_call>' -}}"
-                    "{%- endfor -%}"
-                "{%- endif -%}"
-            "{%- elif message.role == 'tool' -%}"
-                "{{- '</tool_response>' -}}"
-            "{%- endif -%}"
-            "{%- if message.role != 'system' -%}"
-                "{{- '<|im_end|>\n' -}}"
-            "{%- endif -%}"
-        "{%- endfor -%}"
+            "{%- endif %}"
+        "{%- endmacro %}"
+
+        "{%- if tools -%}"
+            "{{- '<|im_start|>system\n' }}"
+            "{%- if messages[0].role == 'system' %}"
+                "{{- render_content(messages[0].content, false) + '\n\n' }}"
+            "{%- endif %}"
+            "{{- '# Tools\n\nYou may call one or more functions to assist with the user query.\n\nYou are provided with function signatures within <tools></tools> XML tags:\n<tools>' -}}"
+            "{%- for tool in tools -%}"
+                "{{- '\n' -}}"
+                "{{- tool | tojson -}}"
+            "{%- endfor -%}"
+            "{{- '\n</tools>\n\nFor each function call, return a json object with function name and arguments within <tool_call></tool_call> XML tags:\n<tool_call>\n{\"name\": <function-name>, \"arguments\": <args-json-object>}\n</tool_call><|im_end|>\n' -}}"
+        "{%- else %}"
+            "{%- if messages[0].role == 'system' %}"
+                "{{- '<|im_start|>system\n' + render_content(messages[0].content, false) + '<|im_end|>\n' }}"
+            "{%- endif %}"
+        "{%- endif %}"
+
+        "{%- set ns = namespace(multi_step_tool=true, last_query_index=messages|length - 1) %}"
+        "{%- for message in messages[::-1] %}"
+            "{%- set index = (messages|length - 1) - loop.index0 %}"
+            "{%- if ns.multi_step_tool and message.role == \"user\" %}"
+                "{%- set content = render_content(message.content, false) %}"
+                "{%- if not(content.startswith('<tool_response>') and content.endswith('</tool_response>')) %}"
+                    "{%- set ns.multi_step_tool = false %}"
+                    "{%- set ns.last_query_index = index %}"
+                "{%- endif %}"
+            "{%- endif %}"
+        "{%- endfor %}"
+
+        "{%- for message in messages %}"
+            "{%- set content = render_content(message.content, True) %}"
+            "{%- if (message.role == \"user\") or (message.role == \"system\" and not loop.first) %}"
+                "{{- '<|im_start|>' + message.role + '\n' + content + '<|im_end|>' + '\n' }}"
+            "{%- elif message.role == \"assistant\" %}"
+                "{%- set reasoning_content = '' %}"
+                "{%- if message.reasoning_content is string %}"
+                    "{%- set reasoning_content = message.reasoning_content %}"
+                "{%- else %}"
+                    "{%- if '</think>' in content %}"
+                        "{%- set reasoning_content = content.split('</think>')[0].rstrip('\n').split('<think>')[-1].lstrip('\n') %}"
+                        "{%- set content = content.split('</think>')[-1].lstrip('\n') %}"
+                    "{%- endif %}"
+                "{%- endif %}"
+                "{%- if loop.index0 > ns.last_query_index %}"
+                    "{%- if loop.last or (not loop.last and reasoning_content) %}"
+                        "{{- '<|im_start|>' + message.role + '\n<think>\n' + reasoning_content.strip('\n') + '\n</think>\n\n' + content.lstrip('\n') }}"
+                    "{%- else %}"
+                        "{{- '<|im_start|>' + message.role + '\n' + content }}"
+                    "{%- endif %}"
+                "{%- else %}"
+                    "{{- '<|im_start|>' + message.role + '\n' + content }}"
+                "{%- endif %}"
+                "{%- if message.tool_calls %}"
+                    "{%- for tool_call in message.tool_calls %}"
+                        "{%- if (loop.first and content) or (not loop.first) %}"
+                            "{{- '\n' }}"
+                        "{%- endif %}"
+                        "{%- if tool_call.function %}"
+                            "{%- set tool_call = tool_call.function %}"
+                        "{%- endif %}"
+                        "{{- '<tool_call>\n{\"name\": \"' }}"
+                        "{{- tool_call.name }}"
+                        "{{- '\", \"arguments\": ' }}"
+                        "{%- if tool_call.arguments is string %}"
+                            "{{- tool_call.arguments }}"
+                        "{%- else %}"
+                            "{{- tool_call.arguments | tojson }}"
+                        "{%- endif %}"
+                        "{{- '}\n</tool_call>' }}"
+                    "{%- endfor %}"
+                "{%- endif %}"
+                "{{- '<|im_end|>\n' }}"
+            "{%- elif message.role == \"tool\" %}"
+                "{%- if loop.first or (messages[loop.index0 - 1].role != \"tool\") %}"
+                    "{{- '<|im_start|>user' }}"
+                "{%- endif %}"
+                "{{- '\n<tool_response>\n' }}"
+                "{{- content }}"
+                "{{- '\n</tool_response>' }}"
+                "{%- if loop.last or (messages[loop.index0 + 1].role != \"tool\") %}"
+                    "{{- '<|im_end|>\n' }}"
+                "{%- endif %}"
+            "{%- endif %}"
+        "{%- endfor %}"
+
         "{%- if add_generation_prompt -%}"
             "{{- '<|im_start|>assistant\n' -}}"
             "{%- if force_reasoning -%}"
@@ -3819,7 +4232,7 @@ class Qwen3VLChatHandler(MTMDChatHandler):
 
 class Qwen35ChatHandler(MTMDChatHandler):
     """
-    Handler for Qwen3.5/Qwen3.6 models.
+    Handler for Qwen3.5/Qwen3.6/Qwen3.8 models.
     """
     CHAT_FORMAT = (
         "{%- set image_count = namespace(value=0) -%}"
@@ -3848,8 +4261,7 @@ class Qwen35ChatHandler(MTMDChatHandler):
         "                    {{- item.image_url.url -}}"
         "                {%- endif -%}"
         "                {{- '<|vision_end|>' -}}"
-        "            {%- elif 'video' in item -%}"
-        "                {{- raise_exception('llama.cpp does not currently support video.') -}}"  # Video not supported, raise exception
+        "            {%- elif 'video' in item or 'video_url' in item or item.type == 'video' or item.type == 'video_url' -%}"
         "                {%- if is_system_content -%}"
         "                    {{- raise_exception('System message cannot contain videos.') -}}"
         "                {%- endif -%}"
@@ -3860,7 +4272,11 @@ class Qwen35ChatHandler(MTMDChatHandler):
         "                    {{- 'Video ' ~ video_count.value ~ ': ' -}}"
         "                {%- endif -%}"
         "                {{- '<|vision_start|>' -}}"
-        "                {{- item.video -}}"
+        "                {%- if 'video' in item -%}"
+        "                    {{- item.video if item.video is string else item.video.url -}}"
+        "                {%- elif 'video_url' in item -%}"
+        "                    {{- item.video_url if item.video_url is string else item.video_url.url -}}"
+        "                {%- endif -%}"
         "                {{- '<|vision_end|>' -}}"
         "            {%- elif 'text' in item -%}"
         "                {{- item.text -}}"

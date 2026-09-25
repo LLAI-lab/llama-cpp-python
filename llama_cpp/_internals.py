@@ -4,6 +4,7 @@ import ctypes
 import enum
 import os
 import sys
+import weakref
 
 from typing import (
     Callable,
@@ -650,6 +651,10 @@ class LlamaContext:
 
     def close(self):
         """Manually free LlamaContext resources."""
+        for cache in list(getattr(self, "_checkpoint_caches", ())):
+            cache.close()
+        if hasattr(self, "_checkpoint_caches"):
+            self._checkpoint_caches.clear()
         if getattr(self, "ctx", None) is not None:
             try:
                 llama_cpp.llama_free(self.ctx)
@@ -712,12 +717,35 @@ class LlamaContext:
 
     # // Memory API
 
+    def _register_checkpoint_cache(self, cache):
+        """Track a borrower without extending its lifetime."""
+        self._assert_ctx()
+        if not hasattr(self, "_checkpoint_caches"):
+            self._checkpoint_caches = weakref.WeakSet()
+        self._checkpoint_caches.add(cache)
+        cache._context_ref = weakref.ref(self)
+
+    def _invalidate_checkpoints(
+        self, seq_id: int = -1, *, suffix_start: Optional[int] = None,
+        keep_seq_id: Optional[int] = None, device_only: bool = False,
+    ) -> None:
+        """Invalidate registered partial snapshots, not draft engine state.
+
+        Raw C API calls and automatic SWA eviction bypass this bookkeeping.
+        Callers still own token/output synchronization and shared-KV dependencies.
+        """
+        for cache in list(getattr(self, "_checkpoint_caches", ())):
+            if device_only and not cache.on_device:
+                continue
+            cache._invalidate_memory(seq_id, suffix_start, keep_seq_id)
+
     def get_memory(self):
         """Return the context-owned native memory/KV-cache handle.
 
         The handle is non-owning and must not be freed by Python. Operations on
         it do not implicitly wait for pending graph execution.
         """
+        self._assert_ctx()
         return llama_cpp.llama_get_memory(self.ctx)
 
     def memory_clear(self, data: bool):
@@ -726,7 +754,9 @@ class LlamaContext:
         This method does not synchronize pending backend work. Callers use it
         at reset or other established context boundaries.
         """
-        llama_cpp.llama_memory_clear(self.get_memory(), data)
+        memory = self.get_memory()
+        self._invalidate_checkpoints()
+        llama_cpp.llama_memory_clear(memory, data)
 
     def memory_seq_rm(self, seq_id: int, p0: int, p1: int) -> bool:
         """Remove sequence cells in ``[p0, p1)``.
@@ -736,10 +766,17 @@ class LlamaContext:
         when the selected memory implementation cannot remove only that range.
         The operation does not synchronize pending backend work.
         """
-        if self.ctx is not None:
-            return llama_cpp.llama_memory_seq_rm(self.get_memory(), seq_id, p0, p1)
-        else:
-            return False
+        memory = self.get_memory()
+        try:
+            removed = llama_cpp.llama_memory_seq_rm(memory, seq_id, p0, p1)
+        except BaseException:
+            self._invalidate_checkpoints(seq_id)
+            raise
+        if removed and (p1 < 0 or p1 > max(0, p0)):
+            self._invalidate_checkpoints(
+                seq_id, suffix_start=max(0, p0) if p1 < 0 else None
+            )
+        return removed
 
     def memory_seq_cp(self, seq_id_src: int, seq_id_dst: int, p0: int, p1: int):
         """Copy source-sequence memory cells in ``[p0, p1)`` to a destination.
@@ -747,19 +784,30 @@ class LlamaContext:
         Negative bounds follow the same convention as ``memory_seq_rm()``.
         This operation does not synchronize pending backend work.
         """
-        llama_cpp.llama_memory_seq_cp(self.get_memory(), seq_id_src, seq_id_dst, p0, p1)
+        memory = self.get_memory()
+        if seq_id_src != seq_id_dst and (p1 < 0 or p1 > max(0, p0)):
+            self._invalidate_checkpoints(seq_id_dst)
+        llama_cpp.llama_memory_seq_cp(memory, seq_id_src, seq_id_dst, p0, p1)
 
     def memory_seq_keep(self, seq_id: int):
         """Keep only memory cells assigned to ``seq_id`` without synchronizing."""
-        llama_cpp.llama_memory_seq_keep(self.get_memory(), seq_id)
+        memory = self.get_memory()
+        self._invalidate_checkpoints(keep_seq_id=seq_id)
+        llama_cpp.llama_memory_seq_keep(memory, seq_id)
 
     def memory_seq_add(self, seq_id: int, p0: int, p1: int, delta: int):
         """Add ``delta`` to positions in ``[p0, p1)`` without synchronizing."""
-        llama_cpp.llama_memory_seq_add(self.get_memory(), seq_id, p0, p1, delta)
+        memory = self.get_memory()
+        if delta != 0 and (p1 < 0 or p1 > max(0, p0)):
+            self._invalidate_checkpoints(seq_id)
+        llama_cpp.llama_memory_seq_add(memory, seq_id, p0, p1, delta)
 
     def memory_seq_div(self, seq_id: int, p0: int, p1: int, d: int):
         """Integer-divide positions in ``[p0, p1)`` without synchronizing."""
-        llama_cpp.llama_memory_seq_div(self.get_memory(), seq_id, p0, p1, d)
+        memory = self.get_memory()
+        if d != 1 and (p1 < 0 or p1 > max(0, p0)):
+            self._invalidate_checkpoints(seq_id)
+        llama_cpp.llama_memory_seq_div(memory, seq_id, p0, p1, d)
 
     def memory_seq_pos_max(self, seq_id: int) -> int:
         """Return the greatest cached position for ``seq_id``, or native sentinel."""
@@ -781,6 +829,7 @@ class LlamaContext:
         This is the actual save size, not a guaranteed upper bound for loading
         an arbitrary state produced by another context.
         """
+        self._assert_ctx()
         return llama_cpp.llama_state_get_size(self.ctx)
 
     def get_state_data(self, dst:ctypes.Array[ctypes.c_uint8], size: int) -> int:
@@ -789,10 +838,13 @@ class LlamaContext:
         Returns the number of bytes written. ``dst`` must provide at least
         ``size`` writable bytes.
         """
+        self._assert_ctx()
         return llama_cpp.llama_state_get_data(self.ctx, dst, size)
 
     def set_state_data(self, src:ctypes.Array[ctypes.c_uint8], size: int) -> int:
         """Synchronize, restore complete state from ``src``, and return bytes read."""
+        self._assert_ctx()
+        self._invalidate_checkpoints()
         return llama_cpp.llama_state_set_data(self.ctx, src, size)
 
     def load_state_file(
@@ -803,6 +855,8 @@ class LlamaContext:
         n_token_count_out: CtypesPointer[ctypes.c_size_t]
     ) -> bool:
         """Synchronize, then load complete state and token history from a file."""
+        self._assert_ctx()
+        self._invalidate_checkpoints()
         return llama_cpp.llama_state_load_file(self.ctx, path_session, tokens_out, n_token_capacity, n_token_count_out)
 
     def save_state_file(
@@ -812,18 +866,23 @@ class LlamaContext:
         n_token_count: ctypes.c_size_t
     ) -> bool:
         """Synchronize, then save complete state and token history to a file."""
+        self._assert_ctx()
         return llama_cpp.llama_state_save_file(self.ctx, path_session, tokens, n_token_count)
 
     def get_state_seq_size(self, seq_id: int) -> int:
         """Return the exact host-serialized state size for one sequence."""
+        self._assert_ctx()
         return llama_cpp.llama_state_seq_get_size(self.ctx, seq_id)
 
     def get_state_seq_data(self, dst: ctypes.Array[ctypes.c_uint8], size: int, seq_id: int) -> int:
         """Synchronize and copy one sequence state into ``dst``."""
+        self._assert_ctx()
         return llama_cpp.llama_state_seq_get_data(self.ctx, dst, size, seq_id)
 
     def set_state_seq_data(self, src: ctypes.Array[ctypes.c_uint8], size: int, dest_seq_id: int) -> int:
         """Synchronize and restore serialized state into ``dest_seq_id``."""
+        self._assert_ctx()
+        self._invalidate_checkpoints(dest_seq_id)
         return llama_cpp.llama_state_seq_set_data(self.ctx, src, size, dest_seq_id)
 
     def load_state_seq_file(
@@ -835,6 +894,8 @@ class LlamaContext:
         n_token_count_out: CtypesPointer[ctypes.c_size_t]
     ) -> int:
         """Synchronize, then load sequence state and tokens into ``dest_seq_id``."""
+        self._assert_ctx()
+        self._invalidate_checkpoints(dest_seq_id)
         return llama_cpp.llama_state_seq_load_file(self.ctx, filepath, dest_seq_id, tokens_out, n_token_capacity, n_token_count_out)
 
     def save_state_seq_file(
@@ -845,6 +906,7 @@ class LlamaContext:
         n_token_count: ctypes.c_size_t
     ) -> int:
         """Synchronize, then save one sequence state and tokens to a file."""
+        self._assert_ctx()
         return llama_cpp.llama_state_seq_save_file(self.ctx, filepath, seq_id, tokens, n_token_count)
 
     def get_state_seq_size_ext(self, seq_id: int, flags: llama_cpp.llama_state_seq_flags) -> int:
@@ -854,6 +916,7 @@ class LlamaContext:
         request device-resident snapshots. Device snapshots are opaque and a
         subsequent capture for the same sequence invalidates the prior one.
         """
+        self._assert_ctx()
         return llama_cpp.llama_state_seq_get_size_ext(self.ctx, seq_id, flags)
 
     def get_state_seq_data_ext(
@@ -867,6 +930,9 @@ class LlamaContext:
 
         Returns the number of bytes or opaque handle bytes written to ``dst``.
         """
+        self._assert_ctx()
+        if flags & llama_cpp.LLAMA_STATE_SEQ_FLAGS_ON_DEVICE:
+            self._invalidate_checkpoints(seq_id, device_only=True)
         return llama_cpp.llama_state_seq_get_data_ext(self.ctx, dst, size, seq_id, flags)
 
     def set_state_seq_data_ext(
@@ -877,6 +943,8 @@ class LlamaContext:
         flags: llama_cpp.llama_state_seq_flags
     ) -> int:
         """Synchronize and restore an extended snapshot into ``dest_seq_id``."""
+        self._assert_ctx()
+        self._invalidate_checkpoints(dest_seq_id)
         return llama_cpp.llama_state_seq_set_data_ext(self.ctx, src, size, dest_seq_id, flags)
 
     # // Decoding API
@@ -920,11 +988,15 @@ class LlamaContext:
         try:
             return_code = llama_cpp.llama_decode(self.ctx, batch.batch)
         except Exception as e:
+            self._invalidate_checkpoints()
             raise RuntimeError(
                 "llama_decode raised a native exception before returning a status code. "
                 "This may indicate an invalid batch, invalid token id, corrupted context, "
                 "backend memory issue, or native access violation."
             ) from e
+
+        if return_code not in (0, 1):
+            self._invalidate_checkpoints()
 
         if return_code == 0:
             return 0
@@ -2348,6 +2420,7 @@ class LlamaSamplingParams:
 
     logit_bias: List[llama_cpp.llama_logit_bias] = field(default_factory=list)
     logit_bias_eog: List[llama_cpp.llama_logit_bias] = field(default_factory=list)
+    grammar_root: str = "root"
 
     @property
     def has_logit_bias(self) -> bool:
@@ -2383,7 +2456,11 @@ class LlamaSamplingParams:
 
 class GrammarSampler:
 
-    def __init__(self, model, grammar_str, lazy=False, triggers=None):
+    def __init__(self, model, grammar_str, lazy=False, triggers=None, root="root"):
+
+        self.grammar = None
+        self.model = None
+        self.vocab = None
 
         if model is None:
             raise ValueError("model must not be None")
@@ -2391,26 +2468,58 @@ class GrammarSampler:
         self.model = model
         self.vocab = model.vocab
 
-        if not grammar_str:
-            raise ValueError("grammar_str must not be empty")
+        definition = LlamaGrammar.from_string(grammar_str, root=root, triggers=triggers)
+        triggers = definition.triggers
 
-        self.grammar = llama_cpp.llama_sampler_init_grammar(
-            self.vocab,
-            grammar_str.encode("utf-8"),
-            b"root"
-        )
+        if lazy:
+            if not triggers:
+                raise ValueError("lazy grammar requires at least one trigger")
+            patterns, tokens = [], []
+            for trigger in triggers or []:
+                if isinstance(trigger, str):
+                    if '\x00' in trigger:
+                        raise ValueError("trigger patterns must contain no NUL characters")
+                    patterns.append(trigger.encode("utf-8"))
+                elif type(trigger) is int:
+                    tokens.append(trigger)
+                else:
+                    raise TypeError("grammar triggers must be regex strings or token integers")
+            c_patterns = (ctypes.c_char_p * len(patterns))(*patterns)
+            c_tokens = (llama_cpp.llama_token * len(tokens))(*tokens)
+            self.grammar = llama_cpp.llama_sampler_init_grammar_lazy_patterns(
+                self.vocab, grammar_str.encode("utf-8"), root.encode("utf-8"),
+                c_patterns, len(patterns), c_tokens, len(tokens),
+            )
+        else:
+            self.grammar = llama_cpp.llama_sampler_init_grammar(
+                self.vocab, grammar_str.encode("utf-8"), root.encode("utf-8")
+            )
 
         if not self.grammar:
             raise RuntimeError("Failed to initialize grammar sampler")
 
     def apply(self, token_data):
+        self._require_open()
         llama_cpp.llama_sampler_apply(self.grammar, token_data)
 
     def accept(self, token):
+        self._require_open()
         llama_cpp.llama_sampler_accept(self.grammar, token)
 
     def reset(self):
+        self._require_open()
         llama_cpp.llama_sampler_reset(self.grammar)
+
+    def _require_open(self):
+        if not self.grammar:
+            raise RuntimeError("Grammar sampler is closed")
+
+    def __enter__(self):
+        self._require_open()
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        self.close()
 
     def close(self):
         if self.grammar:
@@ -2508,6 +2617,7 @@ class LlamaSamplingContext:
                 params.grammar,
                 params.grammar_lazy,
                 params.grammar_triggers,
+                root=params.grammar_root,
             )
 
     def _build_sampler_chain(self):
@@ -2713,27 +2823,33 @@ class LlamaSamplingContext:
         ctx: LlamaContext,
         idx: int = -1,
         grammar_first: bool = True,
+        logits: Optional[npt.NDArray[np.single]] = None,
     ) -> int:
 
         # 1. Backend sampler shortcut. The accessor synchronizes pending work.
-        sampled = ctx.get_sampled_token_ith(idx)
+        sampled = ctx.get_sampled_token_ith(idx) if logits is None else llama_cpp.LLAMA_TOKEN_NULL
         if sampled != llama_cpp.LLAMA_TOKEN_NULL:
             if self.grammar_sampler:
                 raise RuntimeError("Backend sampling + grammar unsupported")
             return int(sampled)
 
         # 2. Build cur_p from the full-vocabulary fallback logits.
-        logits_ptr = ctx.get_logits_ith(idx)
-        cur_addr = ctypes.addressof(logits_ptr.contents)
-
-        if self._logits_ptr_addr != cur_addr:
-            self._logits_view = np.ctypeslib.as_array(
-                logits_ptr,
-                shape=(self.n_vocab,),
-            )
-            self._logits_ptr_addr = cur_addr
-
-        logits_array = self._logits_view
+        if logits is None:
+            logits_ptr = ctx.get_logits_ith(idx)
+            cur_addr = ctypes.addressof(logits_ptr.contents)
+            if self._logits_ptr_addr != cur_addr:
+                self._logits_view = np.ctypeslib.as_array(
+                    logits_ptr, shape=(self.n_vocab,),
+                )
+                self._logits_ptr_addr = cur_addr
+            logits_array = self._logits_view
+        else:
+            # A full native memory restore does not restore context outputs.
+            # Sample the independently owned snapshot without consulting any
+            # stale backend sampled token or output pointer.
+            if logits.shape != (self.n_vocab,):
+                raise ValueError("Sampling logits must contain the full vocabulary")
+            logits_array = logits
         # Backend sampling returns before this point. Allocate the full-vocabulary
         # CPU candidate array only when a CPU sampler/grammar fallback actually
         # needs it; this matters for vocabularies with hundreds of thousands of
@@ -3630,7 +3746,9 @@ class LlamaSampler:
         model: LlamaModel,
         grammar_str: str,
         lazy: bool = False,
-        triggers: List[Union[str, int]] = None
+        triggers: List[Union[str, int]] = None,
+        *,
+        root: str = "root",
     ):
         """
         Adds a grammar sampler.
@@ -3638,10 +3756,13 @@ class LlamaSampler:
             grammar_str: The BNF grammar string.
             root: The root rule name.
             lazy: If True, enables lazy evaluation.
-            triggers: List of trigger words (str) or tokens (int) for lazy evaluation.
+            triggers: List of regex patterns (str) or token IDs (int) for lazy evaluation.
         """
         c_grammar_str = grammar_str.encode('utf-8')
-        c_root = "root".encode('utf-8')
+        definition = LlamaGrammar.from_string(grammar_str, root=root, triggers=triggers)
+        if lazy and not definition.triggers:
+            raise ValueError("lazy grammar requires at least one trigger")
+        c_root = root.encode('utf-8')
 
         self._keep_alive.append(c_grammar_str)
         self._keep_alive.append(c_root)

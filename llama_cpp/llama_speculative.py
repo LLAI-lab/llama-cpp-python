@@ -406,6 +406,8 @@ class LlamaSpecEngine(abc.ABC):
     owned by :class:`Llama`.
     """
 
+    supports_predecoded_media = False
+
     def begin(self, prompt_tokens: Sequence[int], seq_id: int = 0) -> None:
         """Initialize request state from the already-decoded prompt tokens.
 
@@ -442,6 +444,26 @@ class LlamaSpecEngine(abc.ABC):
         without a speculative suffix.
         """
         raise NotImplementedError()
+
+    def draft_at_position(
+        self,
+        input_ids: Sequence[int],
+        *,
+        pos0: int,
+        id_last: int,
+        n_max: int,
+        seq_id: int = 0,
+    ) -> npt.NDArray[np.intc]:
+        """Draft at a native position, independently of the history length.
+
+        The legacy ``draft(n_past=...)`` keyword denotes this same position.
+        Delegate to it so existing custom engines remain compatible.
+        """
+        if pos0 < 0:
+            raise ValueError("Draft start position must be non-negative")
+        return self.draft(
+            input_ids, n_past=pos0, id_last=id_last, n_max=n_max, seq_id=seq_id
+        )
 
     def accept(self, n_accepted: int, seq_id: int = 0) -> None:
         """Commit the sampled token plus ``n_accepted`` accepted draft tokens."""
@@ -532,6 +554,8 @@ class LlamaNGramMapDecoding(LlamaSpecEngine):
 
     Aligned with llama.cpp's underlying ngram-map k/k4v algorithm.
     """
+
+    supports_predecoded_media = True
 
     def __init__(
         self,
@@ -879,6 +903,12 @@ class LlamaNGramMapDecoding(LlamaSpecEngine):
             self._last_draft_key = search_key
             self._last_draft_value = best_value
 
+        # Media ledger IDs are opaque markers, never decoder input. Preserve
+        # positions in the history but stop a proposed continuation at media.
+        for i, token in enumerate(draft):
+            if token < 0:
+                draft = draft[:i]
+                break
         self._last_draft_len = len(draft)
         if self._last_draft_len <= 0:
             self._last_draft_key = None
@@ -1549,10 +1579,12 @@ class LlamaMTPDecoding(_LlamaModelDraftEngine):
         if seq_id != 0:
             raise NotImplementedError("MTP speculative decoding currently supports seq_id=0")
 
+        self._checkpoint_owner = object()
         started = time.perf_counter()
         try:
             position = self.draft_context.memory_seq_pos_max(seq_id)
             checkpoint: Dict[str, Any] = {
+                "owner": self._checkpoint_owner,
                 "position": position,
                 "mode": "native",
                 "buffer": None,
@@ -1616,6 +1648,10 @@ class LlamaMTPDecoding(_LlamaModelDraftEngine):
         if seq_id != 0:
             raise NotImplementedError("MTP speculative decoding currently supports seq_id=0")
 
+        owner = getattr(self, "_checkpoint_owner", None)
+        if owner is None or checkpoint.get("owner") is not owner:
+            raise RuntimeError("Draft checkpoint is stale or belongs to another engine")
+
         started = time.perf_counter()
         try:
             if checkpoint["mode"] == "on-device":
@@ -1639,6 +1675,9 @@ class LlamaMTPDecoding(_LlamaModelDraftEngine):
             self.verify_h = np.empty((0, self.n_embd), dtype=np.float32)
             self.verify_tokens.clear()
             self.verify_positions.clear()
+        except BaseException:
+            self._checkpoint_owner = None
+            raise
         finally:
             self._checkpoint_stats["restores"] += 1
             self._checkpoint_stats["restore_seconds"] += (
@@ -1678,6 +1717,7 @@ class LlamaMTPDecoding(_LlamaModelDraftEngine):
 
     def clear(self) -> None:
         """Clear request-local MTP state while keeping native resources loaded."""
+        self._checkpoint_owner = None
         if self._closed:
             return
         self._pending_verification_checkpoint = None
@@ -1690,6 +1730,7 @@ class LlamaMTPDecoding(_LlamaModelDraftEngine):
 
     def close(self) -> None:
         """Idempotently release MTP batches, context, sampler, and owned model."""
+        self._checkpoint_owner = None
         if self._closed:
             return
         self._closed = True
@@ -2214,6 +2255,10 @@ class LlamaDFlashDecoding(_LlamaModelDraftEngine):
                     "DFlash speculative decoding currently supports one sequence"
                 )
 
+        # Match llama.cpp: pinned image rows can exhaust a windowed draft cache.
+        if has_embeddings and n_tokens > 1 and batch.pos[0] == batch.pos[n_tokens - 1]:
+            return
+
         chunk_size = self.draft_context.n_ubatch()
         feature_chunks: List[npt.NDArray[np.float32]] = []
         for offset in range(0, n_tokens, chunk_size):
@@ -2276,9 +2321,11 @@ class LlamaDFlashDecoding(_LlamaModelDraftEngine):
             raise NotImplementedError(
                 "DFlash speculative decoding currently supports seq_id=0"
             )
+        self._checkpoint_owner = object()
         started = time.perf_counter()
         try:
             checkpoint: Dict[str, Any] = {
+                "owner": self._checkpoint_owner,
                 "position": self.draft_context.memory_seq_pos_max(seq_id),
                 "mode": "native",
                 "buffer": None,
@@ -2337,6 +2384,10 @@ class LlamaDFlashDecoding(_LlamaModelDraftEngine):
             raise NotImplementedError(
                 "DFlash speculative decoding currently supports seq_id=0"
             )
+        owner = getattr(self, "_checkpoint_owner", None)
+        if owner is None or checkpoint.get("owner") is not owner:
+            raise RuntimeError("Draft checkpoint is stale or belongs to another engine")
+
         started = time.perf_counter()
         try:
             if checkpoint["mode"] == "on-device":
@@ -2370,6 +2421,9 @@ class LlamaDFlashDecoding(_LlamaModelDraftEngine):
                 (0, self.n_embd_enc), dtype=np.float32
             )
             self._active_verification_checkpoint = None
+        except BaseException:
+            self._checkpoint_owner = None
+            raise
         finally:
             self._checkpoint_stats["restores"] += 1
             self._checkpoint_stats["restore_seconds"] += (
@@ -2595,6 +2649,7 @@ class LlamaDFlashDecoding(_LlamaModelDraftEngine):
 
     def clear(self) -> None:
         """Clear request-local draft cache and verification bookkeeping."""
+        self._checkpoint_owner = None
         if self._closed:
             return
         self._pending_verification_checkpoint = None
@@ -2609,6 +2664,7 @@ class LlamaDFlashDecoding(_LlamaModelDraftEngine):
 
     def close(self) -> None:
         """Idempotently release all DFlash/DSpark native resources."""
+        self._checkpoint_owner = None
         if self._closed:
             return
         self._closed = True

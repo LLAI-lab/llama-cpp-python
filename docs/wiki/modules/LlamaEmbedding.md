@@ -3,7 +3,7 @@ title: Llama Embedding
 module_name: llama_cpp.llama_embedding
 source_file: llama_cpp/llama_embedding.py
 class_name: LlamaEmbedding
-last_updated: 2026-07-26
+last_updated: 2026-09-19
 version_target: "latest"
 ---
 
@@ -11,7 +11,9 @@ version_target: "latest"
 
 ## Overview
 
-`LlamaEmbedding` is a specialized class for high-performance Text Embedding and Reranking. It inherits from the base `Llama` class but is optimized for vector operations.
+`LlamaEmbedding` provides embedding-oriented defaults and reranking helpers on
+top of `Llama`. Its `embed()` method uses the base implementation while retaining
+L2 normalization as the default.
 
 ### Support Embeddings & Rerank Model:
 
@@ -40,7 +42,7 @@ version_target: "latest"
 | `n_ubatch` | int | 512 | Physical batch size. |
 | `n_seq_max` | int | 1 (inherited) | Maximum number of independent sequence IDs available in a decode batch. Increase this for parallel embedding batches. |
 | `pooling_type` | int | `LLAMA_POOLING_TYPE_UNSPECIFIED` (-1) | Pooling strategy used by the model: `LLAMA_POOLING_TYPE_RANK` (4) for rerankers, `LLAMA_POOLING_TYPE_UNSPECIFIED` (-1) for embeddings. |
-| `n_gpu_layers` | int | 0 | Number of layers offloaded to GPU (0 = CPU only, -1 = all layers). |
+| `n_gpu_layers` | int | 0 | Number of model layers offloaded to GPU. `0` disables layer offload but does not guarantee that every operation avoids an available GPU backend; `-1` uses automatic offload. |
 | `verbose` | bool | True | Whether to print debug information. |
 | `**kwargs` | Any | — | Extra arguments passed to the `Llama` base class (e.g., `n_batch`, `n_ctx`, `verbose`). |
 
@@ -110,12 +112,14 @@ larger values may require more context resources.
 - `return_count=False`: List of embedding vectors.
 - `return_count=True`: Tuple `(embeddings, token_count)`.
 
-**Internal Logic:**
-1. Determines mode based on `pooling_type`: `LLAMA_POOLING_TYPE_NONE` (token-level), `LLAMA_POOLING_TYPE_RANK` (rerank), or other (sequence-level).
-2. Uses streaming batch decoding to process embeddings in chunks.
-3. For token-level mode, extracts and normalizes per-token vectors.
-4. For sequence-level mode, extracts sequence vectors and normalizes.
-5. Supports `separator` for splitting input into multiple documents.
+**Implementation and lifecycle:**
+
+`LlamaEmbedding.embed()` delegates to [Llama.embed()](../core/Llama.md#embedinput-normalizefalse-truncatetrue-separatornone-return_countfalse).
+It retains the L2 default and treats an empty separator as no splitting. The
+shared implementation packs whole inputs into batches, copies borrowed output
+vectors, and resets generation state before execution and during final cleanup.
+Decode or output-extraction failures cannot leave a reusable partial request.
+Rank output remains unnormalized; returned vectors are independent Python data.
 
 ### `rank(query, documents)`
 
